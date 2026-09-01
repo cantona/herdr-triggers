@@ -1,0 +1,76 @@
+# herdr-plugin.toml -- manifest for herdr-triggers.
+#
+# The daemon is started by the [[startup]] hook. herdr spawns hook commands and
+# wait()s on them with a 32-in-flight cap, so `start` forks, setsid()s and exits
+# 0 immediately; the daemon itself keeps running and writes its own log into
+# $HERDR_PLUGIN_STATE_DIR/<server>/. herdr's plugin log records the hook
+# command, which exits immediately, and knows nothing of the detached daemon it
+# leaves running - hence the daemon's own log. The server name is part of the
+# path because a machine can run several herdr servers and their pidfiles and
+# locks must not collide; `triggers-status` prints the socket and state dir it
+# resolved to.
+#
+# No secret ever appears in this file. Rules reference secrets as
+# ${secret:NAME} and the value is read at fire time from a 0600 secrets.toml in
+# $HERDR_PLUGIN_CONFIG_DIR.
+
+id = "herdr-triggers"
+name = "herdr-triggers"
+version = "0.1.0"
+description = "Resident regex triggers over pane output: automated logins and other regex-driven terminal triggers."
+# The version this was developed and tested against. The plugin reads pane
+# labels, tab and workspace labels, terminal ids and notification sounds, and
+# none of that was verified against an older herdr - so it claims no more than
+# it knows.
+min_herdr_version = "0.8.2"
+platforms = ["linux", "macos"]
+
+[[build]]
+platforms = ["linux", "macos"]
+command = ["cargo", "build", "--release"]
+
+[[startup]]
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-triggersd", "start"]
+
+[[actions]]
+id = "triggers-start"
+title = "Triggers: start daemon"
+description = "Start the trigger daemon if it is not already running (also runs automatically on session start)."
+contexts = ["global"]
+command = ["./target/release/herdr-triggersd", "start"]
+
+[[actions]]
+id = "triggers-restart"
+title = "Triggers: restart daemon"
+description = "Stop the daemon and start a fresh one; use after rebuilding the binary."
+contexts = ["global"]
+command = ["./target/release/herdr-triggersd", "restart"]
+
+[[actions]]
+id = "triggers-reload"
+title = "Triggers: reload rules"
+description = "Re-read triggers.toml without losing which once rules have already fired."
+contexts = ["global"]
+command = ["./target/release/herdr-triggersd", "reload"]
+
+[[actions]]
+id = "triggers-reset"
+title = "Triggers: re-arm once rules"
+description = "Clear the once-ledger so every once rule can fire again, and drop every armed rule's screen baseline."
+contexts = ["global"]
+command = ["./target/release/herdr-triggersd", "reset"]
+
+[[actions]]
+id = "triggers-status"
+title = "Triggers: status"
+description = "Report daemon state, loaded rule count and recent trigger activity."
+contexts = ["global"]
+command = ["./target/release/herdr-triggersd", "status"]
+
+[[actions]]
+id = "triggers-stop"
+title = "Triggers: stop daemon"
+description = "Stop the trigger daemon until the next herdr start or manual restart."
+contexts = ["global"]
+command = ["./target/release/herdr-triggersd", "stop"]

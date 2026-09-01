@@ -1,0 +1,72 @@
+# Automated device login: the case herdr-triggers was built for.
+#
+# Copy to $(herdr plugin config-dir herdr-triggers)/triggers.toml and copy
+# secrets.toml.example next to it as secrets.toml (mode 0600).
+#
+# Scope every credential rule. An unscoped send_text rule will answer a matching
+# prompt in ANY pane, which for a password is exactly the mistake to avoid.
+
+[settings]
+# A floor against a storm, nothing more - the latch is what stops a prompt
+# being answered twice. Keep it SHORT: it is keyed on the matched text, so a
+# console reprompting with identical text (asking again for the real username
+# after a probe) is delayed by exactly this long.
+cooldown_ms = 100
+# Ceiling on fires per second for rules that write into a pane.
+max_writes_per_second = 8
+# The CURRENT screen only, which is also the default. A `recent*` source is
+# refused at load: a socket client cannot ask for a passive read, and herdr
+# answers a scrollback read on an idle agent pane by injecting wheel events to
+# harvest it. `visible` never takes that path, and it also keeps stale prompts
+# from earlier attempts out of the match.
+source = "visible"
+# A console that waits indefinitely at a prompt needs this: the prompt is
+# already on screen whenever the rules arm, and the screen never changes again,
+# so the default suppression would wait forever. Only enable it when the action
+# itself is safe to repeat (a script that inspects the screen and declines).
+fire_on_existing_text = true
+# Response time: a prompt is answered within one interval. 100ms gives a
+# ~190ms two-stage login at 0.1% CPU. Cost per interval is three list calls
+# plus one read per scoped pane, so keep the scope tight.
+poll_ms = 100
+# How much the daemon logs: "all" (default), "fires", or "off". A console's
+# matched prompt text lands in this file, so "fires" or "off" is worth
+# considering - but it is the only record of what the daemon did.
+log = "fires"
+
+# Scope by NAME. `pane_title` is matched against the pane's own title, its tab
+# label AND its workspace label, with any "[N] " position prefix stripped - so
+# naming a workspace or tab "console" is enough, and reordering it changes
+# nothing. A full-screen client often sets no terminal title of its own, which
+# is why the tab and workspace names matter here.
+#
+# Prefer that over `workspace_id`: ids are per herdr server, one daemon runs per
+# server off this same config, and "w1" can mean different things on each -
+# which for a rule that types a password is not a risk worth taking. Anchor the
+# pattern when the name is short.
+[[rules]]
+regex  = "(?i)login:"
+scope  = { pane_title = "(?i)console" }
+# Only the prompt still at the bottom of the screen is the one waiting.
+tail_within = 2
+action = { type = "send_text", text = "${secret:DEVICE_USER}\n" }
+
+[[rules]]
+regex  = "(?i)password:"
+scope  = { pane_title = "(?i)console" }
+tail_within = 2
+action = { type = "send_text", text = "${secret:DEVICE_PASS}\n" }
+
+# Mark the tab once the session is up, so a glance at the tab bar says which
+# devices are logged in. herdr has no tab-colour API, so the label carries it.
+[[rules]]
+regex  = "(?i)welcome|last login"
+once   = true
+scope  = { pane_title = "(?i)console" }
+action = { type = "tab_mark", marker = "● " }
+
+# Not a login rule: shout when a device drops the session, whatever pane it is in.
+[[rules]]
+regex  = "Connection to .* closed"
+once   = false
+action = { type = "notify", title = "Device session ended", body = "${match}" }

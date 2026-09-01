@@ -1,0 +1,21 @@
+[package]
+name = "herdr-triggers"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Resident regex triggers over herdr pane output"
+license = "MIT"
+
+[[bin]]
+name = "herdr-triggersd"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[profile.release]
+strip = true
