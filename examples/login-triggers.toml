@@ -1,6 +1,6 @@
 # Automated device login: the case herdr-triggers was built for.
 #
-# Copy to $(herdr plugin config-dir herdr-triggers)/triggers.toml and copy
+# Copy to $(herdr plugin config-dir cantona.herdr-triggers)/triggers.toml and copy
 # secrets.toml.example next to it as secrets.toml (mode 0600).
 #
 # Scope every credential rule. An unscoped send_text rule will answer a matching

@@ -14,7 +14,7 @@
 # ${secret:NAME} and the value is read at fire time from a 0600 secrets.toml in
 # $HERDR_PLUGIN_CONFIG_DIR.
 
-id = "herdr-triggers"
+id = "cantona.herdr-triggers"
 name = "herdr-triggers"
 version = "0.1.0"
 description = "Resident regex triggers over pane output: automated logins and other regex-driven terminal triggers."

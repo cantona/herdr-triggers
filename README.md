@@ -28,7 +28,7 @@ is installed, so after a mid-session install start the daemon once yourself —
 from then on every server start does it for you:
 
 ```bash
-herdr plugin action invoke triggers-start --plugin herdr-triggers
+herdr plugin action invoke triggers-start --plugin cantona.herdr-triggers
 ```
 
 Pin a version or track a branch with `--ref`, and skip the prompt with `--yes`
@@ -41,11 +41,11 @@ herdr plugin install cantona/herdr-triggers --ref v0.1.0 --yes
 Then write your rules — nothing fires until you do:
 
 ```bash
-$EDITOR "$(herdr plugin config-dir herdr-triggers)/triggers.toml"
-herdr plugin action invoke triggers-reload --plugin herdr-triggers
+$EDITOR "$(herdr plugin config-dir cantona.herdr-triggers)/triggers.toml"
+herdr plugin action invoke triggers-reload --plugin cantona.herdr-triggers
 ```
 
-To remove it: `herdr plugin uninstall herdr-triggers`.
+To remove it: `herdr plugin uninstall cantona.herdr-triggers`.
 
 ### From a checkout, for development
 
@@ -84,7 +84,7 @@ One of many possible uses. Answer a device's `login:` and `Password:` prompts
 from a 0600 secrets file instead of typing them.
 
 ```toml
-# triggers.toml, in `herdr plugin config-dir herdr-triggers`
+# triggers.toml, in `herdr plugin config-dir cantona.herdr-triggers`
 [[rules]]
 regex       = "login:"
 once        = true
@@ -192,7 +192,7 @@ Invoke from a keybinding, or directly — the action id comes first, the plugin
 is a flag:
 
 ```bash
-herdr plugin action invoke triggers-reset --plugin herdr-triggers
+herdr plugin action invoke triggers-reset --plugin cantona.herdr-triggers
 ```
 
 Each action is also a subcommand of the daemon binary, which is what the

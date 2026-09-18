@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 
 use client::Client;
 
-const PLUGIN_ID: &str = "herdr-triggers";
+const PLUGIN_ID: &str = "cantona.herdr-triggers";
 const USAGE: &str = "\
 usage: herdr-triggersd <command> [--session <name> | --socket <path> | --all]
 
