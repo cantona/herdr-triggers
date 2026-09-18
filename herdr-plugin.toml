@@ -16,7 +16,7 @@
 
 id = "cantona.herdr-triggers"
 name = "herdr-triggers"
-version = "0.1.0"
+version = "0.1.1"
 description = "Resident regex triggers over pane output: automated logins and other regex-driven terminal triggers."
 # The version this was developed and tested against. The plugin reads pane
 # labels, tab and workspace labels, terminal ids and notification sounds, and
