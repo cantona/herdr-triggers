@@ -265,7 +265,9 @@ impl Engine {
                 watched += applicable.len();
                 // One read per pane per poll, and one pass over its lines,
                 // both shared by every rule on that pane.
-                let text = self.read_pane(&pane.pane_id);
+                let Some(text) = self.read_pane(&pane.pane_id) else {
+                    continue;
+                };
                 let screen = Screen::new(&text);
                 // A blank screen is still evaluated: it means the pane was
                 // cleared, nothing matches at the tail, and every rule on it
@@ -434,7 +436,7 @@ impl Engine {
             .collect())
     }
 
-    fn read_pane(&self, pane_id: &str) -> String {
+    fn read_pane(&self, pane_id: &str) -> Option<String> {
         let mut params = json!({
             "pane_id": pane_id,
             "source": self.settings.source,
@@ -443,15 +445,25 @@ impl Engine {
         if let Some(lines) = self.settings.lines {
             params["lines"] = json!(lines);
         }
-        match self.client.request("pane.read", params) {
-            Ok(result) => {
+        let result = self
+            .client
+            .request("pane.read", params)
+            .and_then(|mut result| {
+                match result
+                    .get_mut("read")
+                    .and_then(|read| read.get_mut("text"))
+                    .map(Value::take)
+                {
+                    Some(Value::String(text)) => Ok(text),
+                    _ => Err(crate::client::ClientError::Malformed(
+                        "pane.read has no text".into(),
+                    )),
+                }
+            });
+        match result {
+            Ok(text) => {
                 self.read_failures.borrow_mut().remove(pane_id);
-                result
-                    .get("read")
-                    .and_then(|read| read.get("text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string()
+                Some(text)
             }
             Err(err) => {
                 // A failure, not noise: a pane that cannot be read never has
@@ -461,7 +473,7 @@ impl Engine {
                 if self.read_failures.borrow_mut().insert(pane_id.to_string()) {
                     log_line!("cannot read {pane_id}: {err}");
                 }
-                String::new()
+                None
             }
         }
     }
@@ -670,6 +682,115 @@ fn sleep_interruptibly(total: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rule(scope: Option<config::Scope>) -> CompiledRule {
+        CompiledRule::compile(&config::Rule {
+            regex: "Password:".into(),
+            once: false,
+            scope,
+            tail_within: Some(1),
+            action: config::Action::SendText {
+                text: "fixture".into(),
+            },
+        })
+        .unwrap()
+    }
+
+    fn pane(id: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: id.into(),
+            terminal_id: format!("terminal-{id}"),
+            tab_id: "w1:t1".into(),
+            workspace_id: "w1".into(),
+            titles: vec!["shell".into()],
+        }
+    }
+
+    fn with_engine(
+        rules: Vec<CompiledRule>,
+        replies: Vec<(&'static str, Value)>,
+        check: impl FnOnce(&mut Engine),
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::AtomicUsize;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "triggers-engine-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let socket = root.join("api.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (finished, completion) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for (expected, response) in replies {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "missing {expected}");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(e) => panic!("accept: {e}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                let request: Value = serde_json::from_str(&request).unwrap();
+                assert_eq!(request["method"], expected);
+                writeln!(stream, "{}", json!({"id": "req", "result": response})).unwrap();
+            }
+            loop {
+                match listener.accept() {
+                    Ok(_) => panic!("unexpected extra API request"),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("accept: {e}"),
+                }
+                match completion.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let mut engine = Engine::new(Client::new(socket), &root, &root);
+        engine.rules = rules;
+        check(&mut engine);
+        finished.send(()).unwrap();
+        worker.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_reads_preserve_latches_but_blank_screens_rearm() {
+        with_engine(
+            vec![rule(None)],
+            vec![
+                ("pane.read", json!({"read": {"text": "Password:"}})),
+                ("pane.read", json!({"read": {}})),
+                ("pane.read", json!({"read": {"text": "Password:"}})),
+                ("pane.read", json!({"read": {"text": ""}})),
+            ],
+            |engine| {
+                let pane = pane("w1:p1");
+                let key = armed_key(&engine.rules[0].id, &pane.pane_id);
+                for iteration in 0..4 {
+                    if let Some(text) = engine.read_pane(&pane.pane_id) {
+                        engine.evaluate(0, &pane, &text, &Screen::new(&text));
+                    }
+                    assert_eq!(engine.latched.contains_key(&key), iteration != 3);
+                }
+                assert!(engine.read_failures.borrow().is_empty());
+            },
+        );
+    }
 
     #[test]
     fn tab_number_decoration_is_stripped_so_a_scope_can_match_the_name() {
