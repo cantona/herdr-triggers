@@ -350,11 +350,13 @@ and that shapes the limits below.
   one has output beneath it. Put `tail_within = 2` on every rule that types a
   secret. Also set `source = "visible"` for a full-screen client, so scrollback
   from earlier attempts cannot match either.
-- **`poll_ms` is the response time.** A prompt is answered within one interval
-  of appearing. Measured on a two-stage login: `poll_ms = 100` gives ~190 ms at
-  0.1 % CPU; 50 ms buys nothing, as the floor is herdr's own read pipeline.
-  Cost per interval is three list calls (`pane.list`, `tab.list`,
-  `workspace.list`) plus one `pane.read` per watched pane — and each request
+- **`poll_ms` is the wait between passes, not a latency bound.** Screen reads,
+  rule matching and action execution add to that delay. A lower interval does
+  not remove those costs; measure the workload before reducing it.
+  With rules loaded, each interval calls `pane.list` plus one `pane.read` per
+  watched pane. `tab.list` and `workspace.list` are fetched only when a rule
+  uses `scope.pane_title`. With no rules, no API requests are made; reload,
+  reset and stop signals still work. Each request
   opens its own short-lived socket connection, so at the 32-pane ceiling and
   `poll_ms = 100` that is a few hundred connections a second. `scope` is what
   keeps it small: a couple of watched panes costs a fraction of that. At most 32
@@ -435,3 +437,40 @@ that `once` holds on a second login, that the ledger survives a daemon restart,
 and that `triggers-reset` re-arms. Everything it writes lives in a temp dir, and
 it asks the binary where that is rather than assuming; the installed plugin's
 own config and ledger are untouched.
+
+### Isolated performance benchmark
+
+Keep a release build from the comparison revision outside `target`, then run:
+
+```bash
+cargo build --release --locked
+python3 scripts/benchmark.py /path/to/baseline ./target/release/herdr-triggersd
+python3 scripts/benchmark.py ./target/release/herdr-triggersd --verify-reload
+```
+
+The harness uses private Unix sockets and temporary config/state, with synthetic
+screens and rules that never fire. It does not connect to a real Herdr server.
+Each JSON line reports daemon CPU, API request counts, and sampled Linux peak RSS
+(`null` off Linux). It alternates binary order between samples. The reload check
+verifies zero requests with no rules and that SIGHUP activates newly added rules.
+
+Measured on 2026-09-18, Linux x86_64 / i7-10700, release builds versus `44a5ea6`:
+three two-second samples per case, 32 fixture panes, `poll_ms = 50`. Median daemon
+CPU per poll (not end-to-end trigger latency or Herdr server CPU):
+
+| Workload | Before | After | Reduction |
+| --- | ---: | ---: | ---: |
+| 10 pane-ID rules, no matching panes | 0.293 ms | 0.165 ms | 44% |
+| 10 title-scoped rules, 200 lines/pane | 3.760 ms | 2.013 ms | 46% |
+| 100 pane-ID rules, 2,000 lines/pane | 179.559 ms | 91.848 ms | 49% |
+
+With no rules, requests fell from 120 to zero per two-second sample and median
+CPU from 10.465 to 2.173 ms. The dense fixture completed 14–15 polls versus 9,
+so CPU per poll and total CPU over a fixed time are different measures. Memory
+stayed around 4–7 MiB in both builds; no substantial RSS reduction was measured.
+These are short synthetic measurements, not a production latency guarantee.
+
+Polling still reads watched screens and evaluates cooldown/retry state even when
+the text is unchanged. A failed or malformed read preserves latches; only a
+successful blank-screen read clears them. The watch plan retains at most the
+cap plus one overflow entry in each priority bucket while selecting panes.

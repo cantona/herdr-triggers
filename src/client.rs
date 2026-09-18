@@ -138,20 +138,21 @@ impl Client {
 
     /// One request, one response, one connection.
     pub fn request(&self, method: &str, params: Value) -> Result<Value, ClientError> {
-        let stream = UnixStream::connect(&self.path)?;
+        let mut stream = UnixStream::connect(&self.path)?;
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        let mut writer = stream.try_clone()?;
-        let mut reader = BufReader::new(stream);
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
         let frame = json!({"id": "req", "method": method, "params": params});
-        writeln!(writer, "{frame}")?;
-        writer.flush()?;
+        let mut bytes = frame.to_string().into_bytes();
+        bytes.push(b'\n');
+        stream.write_all(&bytes)?;
+        let mut reader = BufReader::new(stream);
 
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
             return Err(ClientError::Closed);
         }
-        let value: Value =
+        let mut value: Value =
             serde_json::from_str(line.trim()).map_err(|_| ClientError::Malformed(line.clone()))?;
         if let Some(error) = value.get("error") {
             return Err(ClientError::Api {
@@ -167,7 +168,10 @@ impl Client {
                     .to_string(),
             });
         }
-        Ok(value.get("result").cloned().unwrap_or(Value::Null))
+        Ok(value
+            .get_mut("result")
+            .map(Value::take)
+            .unwrap_or(Value::Null))
     }
 }
 

@@ -23,7 +23,7 @@ use crate::config::{self, Settings, TriggersConfig};
 use crate::rules::{CompiledRule, FireGuard, Ledger, Screen};
 use crate::{log_detail, log_line};
 
-/// Each poll costs three list calls plus one screen read per watched pane, so
+/// Each poll lists panes (and labels for title scopes) and reads watched screens, so
 /// an unscoped rule set on a big session is capped rather than allowed to
 /// hammer herdr's app thread.
 const MAX_WATCHED_PANES: usize = 32;
@@ -194,6 +194,11 @@ impl Engine {
         while !STOP.load(Ordering::Relaxed) {
             self.drain_control_flags();
 
+            if self.rules.is_empty() {
+                sleep_interruptibly(self.poll_interval());
+                continue;
+            }
+
             let panes = match self.panes() {
                 Ok(panes) => panes,
                 Err(err) => {
@@ -232,31 +237,12 @@ impl Engine {
             // an unscoped rule set, and must never spend the budget on a pane
             // matched only by a broad rule while starving one a credential rule
             // was aimed at.
-            let mut ordered: Vec<&PaneInfo> = panes.iter().collect();
-            ordered.sort_by_key(|pane| {
-                let targeted = self.rules.iter().any(|rule| {
-                    rule.scope.is_some()
-                        && rule.applies_to(&pane.pane_id, &pane.workspace_id, &pane.titles)
-                });
-                !targeted
-            });
+            let ordered = watched_rules(&self.rules, &panes);
 
             let mut watched = 0usize;
             let mut watched_panes = 0usize;
             let mut over_cap = false;
-            for pane in ordered {
-                let applicable: Vec<usize> = (0..self.rules.len())
-                    .filter(|index| {
-                        self.rules[*index].applies_to(
-                            &pane.pane_id,
-                            &pane.workspace_id,
-                            &pane.titles,
-                        )
-                    })
-                    .collect();
-                if applicable.is_empty() {
-                    continue;
-                }
+            for (pane, applicable) in ordered {
                 watched_panes += 1;
                 if watched_panes > MAX_WATCHED_PANES {
                     over_cap = true;
@@ -363,8 +349,16 @@ impl Engine {
 
     fn panes(&self) -> Result<Vec<PaneInfo>, crate::client::ClientError> {
         let result = self.client.request("pane.list", json!({}))?;
-        let tabs = self.tab_labels();
-        let spaces = self.workspace_labels();
+        let needs_labels = self.rules.iter().any(|rule| {
+            rule.scope
+                .as_ref()
+                .is_some_and(|scope| scope.pane_title.is_some())
+        });
+        let (tabs, spaces) = if needs_labels {
+            (self.tab_labels(), self.workspace_labels())
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
         let panes = result
             .get("panes")
             .and_then(Value::as_array)
@@ -495,13 +489,14 @@ impl Engine {
         // match is still "known", so a prompt appearing later is a genuine edge.
         let first_sight = self.known.insert(key.clone());
 
-        let Some(found) = self.rules[index].live_match(screen) else {
+        let last_match = self.rules[index].last_match(screen);
+        let Some(found) = self.rules[index].live_match(last_match) else {
             // Nothing at the tail: answered, or scrolled away. The next one is
             // a fresh occurrence.
             self.latched.remove(&key);
             // Say so once when the text IS on screen but too far up: silently
             // doing nothing is the hardest thing to diagnose.
-            if let Some(stale) = self.rules[index].last_match(screen) {
+            if let Some(stale) = last_match {
                 let signature = stale.signature();
                 if self.reported_stale.insert(key.clone(), signature) != Some(signature) {
                     log_detail!(
@@ -518,7 +513,7 @@ impl Engine {
         };
         self.reported_stale.remove(&key);
         let signature = found.signature();
-        let matched_line = found.line.to_string();
+        let matched_line = found.line;
 
         // Same prompt as the last fire, so do nothing. The signature is the
         // matched line's TEXT ALONE, which means a reprompt carrying identical
@@ -548,7 +543,7 @@ impl Engine {
             self.latched.insert(key, signature);
             return;
         }
-        if !self.guard.would_allow(&id, pane_id, &matched_line) {
+        if !self.guard.would_allow(&id, pane_id, matched_line) {
             // Worth a line, deduped: an over-long cooldown delaying a reprompt
             // with identical text is otherwise invisible, but at poll rate it
             // would flood.
@@ -566,7 +561,7 @@ impl Engine {
         let context = Context {
             pane_id,
             tab_id: &pane.tab_id,
-            matched_line: &matched_line,
+            matched_line,
             screen: text,
             secrets_path: &self.secrets_path,
         };
@@ -583,7 +578,7 @@ impl Engine {
         let outcome = actions::run(&self.client, &self.rules[index], &context);
         // Tokens are spent only now, after the action has actually run: a fire
         // that was never attempted must not consume the retry's budget.
-        self.guard.record(&id, pane_id, &matched_line);
+        self.guard.record(&id, pane_id, matched_line);
         if self.rules[index].action.writes_to_pane() {
             self.guard.record_write(&id);
         }
@@ -631,6 +626,49 @@ impl Engine {
             self.ledger.mark_fired(&id, ledger_id);
         }
     }
+}
+
+fn watched_rules<'a>(
+    rules: &[CompiledRule],
+    panes: &'a [PaneInfo],
+) -> Vec<(&'a PaneInfo, Vec<usize>)> {
+    let mut targeted = Vec::new();
+    let mut broad = Vec::new();
+    let unscoped: Vec<usize> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.scope.is_none())
+        .map(|(index, _)| index)
+        .collect();
+    let scoped: Vec<_> = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.scope.is_some())
+        .collect();
+    // Keep one extra pair to report the cap without retaining every pane/rule pair.
+    let limit = MAX_WATCHED_PANES + 1;
+    for pane in panes {
+        let mut applicable: Vec<usize> = scoped
+            .iter()
+            .filter(|(_, rule)| rule.applies_to(&pane.pane_id, &pane.workspace_id, &pane.titles))
+            .map(|(index, _)| *index)
+            .collect();
+        if applicable.is_empty() {
+            if !unscoped.is_empty() && broad.len() < limit {
+                broad.push((pane, unscoped.clone()));
+            }
+        } else {
+            applicable.extend_from_slice(&unscoped);
+            applicable.sort_unstable();
+            targeted.push((pane, applicable));
+        }
+        if targeted.len() == limit || (scoped.is_empty() && broad.len() == limit) {
+            break;
+        }
+    }
+    let remaining = limit - targeted.len();
+    targeted.extend(broad.into_iter().take(remaining));
+    targeted
 }
 
 /// The poll interval a `poll_ms` setting resolves to. Below the floor the loop
@@ -769,6 +807,122 @@ mod tests {
     }
 
     #[test]
+    fn scopes_are_partitioned_stably_without_losing_rule_order() {
+        let rules = vec![
+            rule(None),
+            rule(Some(config::Scope {
+                pane_id: Some("^target".into()),
+                ..Default::default()
+            })),
+        ];
+        let panes = vec![
+            pane("broad1"),
+            pane("target1"),
+            pane("broad2"),
+            pane("target2"),
+        ];
+        let watched = watched_rules(&rules, &panes);
+        assert_eq!(
+            watched
+                .iter()
+                .map(|(p, _)| p.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            ["target1", "target2", "broad1", "broad2"]
+        );
+        assert_eq!(watched[0].1, [0, 1]);
+        assert_eq!(watched[2].1, [0]);
+        assert!(watched_rules(&[], &panes).is_empty());
+        assert_eq!(watched_rules(&rules[1..], &panes).len(), 2);
+    }
+
+    #[test]
+    fn scoped_panes_stay_ahead_of_the_watch_cap() {
+        let rules = vec![
+            rule(None),
+            rule(Some(config::Scope {
+                pane_id: Some("^target$".into()),
+                ..Default::default()
+            })),
+        ];
+        let mut panes: Vec<_> = (0..MAX_WATCHED_PANES)
+            .map(|i| pane(&format!("broad{i}")))
+            .collect();
+        panes.push(pane("target"));
+        let watched = watched_rules(&rules, &panes);
+        assert_eq!(watched[0].0.pane_id, "target");
+        assert_eq!(
+            watched[MAX_WATCHED_PANES].0.pane_id,
+            format!("broad{}", MAX_WATCHED_PANES - 1)
+        );
+    }
+
+    #[test]
+    fn watch_plan_is_bounded_and_finds_late_scoped_panes() {
+        let rules = vec![
+            rule(None),
+            rule(Some(config::Scope {
+                pane_id: Some("^target$".into()),
+                ..Default::default()
+            })),
+        ];
+        let mut panes: Vec<_> = (0..1000).map(|i| pane(&format!("broad{i}"))).collect();
+        panes.push(pane("target"));
+        let watched = watched_rules(&rules, &panes);
+        assert_eq!(watched.len(), MAX_WATCHED_PANES + 1);
+        assert_eq!(watched[0].0.pane_id, "target");
+        assert_eq!(
+            watched_rules(&rules[..1], &panes).len(),
+            MAX_WATCHED_PANES + 1
+        );
+    }
+
+    #[test]
+    fn id_scopes_do_not_fetch_labels() {
+        let rules = vec![rule(Some(config::Scope {
+            pane_id: Some("w1:".into()),
+            ..Default::default()
+        }))];
+        with_engine(
+            rules,
+            vec![("pane.list", json!({"panes": [{"pane_id": "w1:p1"}]}))],
+            |engine| {
+                assert_eq!(engine.panes().unwrap()[0].pane_id, "w1:p1");
+            },
+        );
+    }
+
+    #[test]
+    fn title_scopes_still_use_tab_and_workspace_labels() {
+        let rules = vec![rule(Some(config::Scope {
+            pane_title: Some("^monitor$|^console$".into()),
+            ..Default::default()
+        }))];
+        with_engine(
+            rules,
+            vec![
+                (
+                    "pane.list",
+                    json!({"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"}]}),
+                ),
+                (
+                    "tab.list",
+                    json!({"tabs": [{"tab_id": "w1:t1", "label": "[2] monitor"}]}),
+                ),
+                (
+                    "workspace.list",
+                    json!({"workspaces": [{"workspace_id": "w1", "label": "[3] console"}]}),
+                ),
+            ],
+            |engine| {
+                let panes = engine.panes().unwrap();
+                assert!(panes[0].titles.iter().any(|s| s == "monitor"));
+                assert!(panes[0].titles.iter().any(|s| s == "console"));
+                assert_eq!(watched_rules(&engine.rules, &panes).len(), 1);
+            },
+        );
+    }
+
+    #[test]
     fn failed_reads_preserve_latches_but_blank_screens_rearm() {
         with_engine(
             vec![rule(None)],
@@ -790,6 +944,22 @@ mod tests {
                 assert!(engine.read_failures.borrow().is_empty());
             },
         );
+    }
+
+    #[test]
+    fn stale_matches_clear_latches_and_keep_diagnostics() {
+        with_engine(vec![rule(None)], vec![], |engine| {
+            let pane = pane("w1:p1");
+            let key = armed_key(&engine.rules[0].id, &pane.pane_id);
+            engine.evaluate(0, &pane, "Password:", &Screen::new("Password:"));
+            assert!(engine.latched.contains_key(&key));
+            let stale = "Password:\nshell\nready";
+            engine.evaluate(0, &pane, stale, &Screen::new(stale));
+            assert!(!engine.latched.contains_key(&key));
+            assert!(engine.reported_stale.contains_key(&key));
+            engine.evaluate(0, &pane, "", &Screen::new(""));
+            assert!(!engine.reported_stale.contains_key(&key));
+        });
     }
 
     #[test]

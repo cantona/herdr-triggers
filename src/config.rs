@@ -52,12 +52,11 @@ pub struct Settings {
     /// starts.
     #[serde(default)]
     pub fire_on_existing_text: bool,
-    /// How often each watched pane's screen is read, in milliseconds. This is
-    /// the response time: a prompt is answered within one interval of
-    /// appearing. Clamped to 50..=60000.
+    /// Wait between polling passes, in milliseconds, clamped to 50..=60000.
+    /// API requests, matching and actions add to the observed response time.
     ///
-    /// Each interval costs three list calls (panes, tabs, workspaces) plus one
-    /// `pane.read` per watched pane, each on its own short-lived connection, so
+    /// Each interval lists panes, plus tabs/workspaces for title scopes, and
+    /// reads each watched pane, each on its own short-lived connection, so
     /// a rule's `scope` decides how much work this is. Keep
     /// `source = "visible"`: it needs no scrollback and is the cheapest read.
     #[serde(default = "default_poll_ms")]

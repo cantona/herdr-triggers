@@ -159,9 +159,8 @@ impl CompiledRule {
     ///
     /// With `tail_within` set and no screen to judge, the answer is `None` -
     /// for a credential rule that is the safe direction.
-    pub fn live_match<'a>(&self, screen: &Screen<'a>) -> Option<Match<'a>> {
-        self.last_match(screen)
-            .filter(|found| self.tail_within.is_none_or(|limit| found.below <= limit))
+    pub fn live_match<'a>(&self, last_match: Option<Match<'a>>) -> Option<Match<'a>> {
+        last_match.filter(|found| self.tail_within.is_none_or(|limit| found.below <= limit))
     }
 
     pub fn applies_to(&self, pane_id: &str, workspace_id: &str, titles: &[String]) -> bool {
@@ -422,7 +421,8 @@ status line | 115200 8N1 | Offline";
             "status line sits below"
         );
         assert!(
-            rule.live_match(&Screen::new(WAITING)).is_some(),
+            rule.live_match(rule.last_match(&Screen::new(WAITING)))
+                .is_some(),
             "the waiting prompt must fire"
         );
 
@@ -432,7 +432,8 @@ status line | 115200 8N1 | Offline";
             "shell banner, help line and two shell prompts sit below it"
         );
         assert!(
-            rule.live_match(&Screen::new(ANSWERED)).is_none(),
+            rule.live_match(rule.last_match(&Screen::new(ANSWERED)))
+                .is_none(),
             "a prompt with a live shell under it must never be answered again"
         );
     }
@@ -447,7 +448,9 @@ status line | 115200 8N1 | Offline";
             rule.last_match(&Screen::new(screen)).map(|m| m.below),
             Some(1)
         );
-        assert!(rule.live_match(&Screen::new(screen)).is_some());
+        assert!(rule
+            .live_match(rule.last_match(&Screen::new(screen)))
+            .is_some());
     }
 
     #[test]
@@ -457,10 +460,10 @@ status line | 115200 8N1 | Offline";
         // prompt, or the action runs again - re-submitting a password.
         let rule = compiled("^Password:", Some(2));
         let before = rule
-            .live_match(&Screen::new("status 10:00:00\nPassword:"))
+            .live_match(rule.last_match(&Screen::new("status 10:00:00\nPassword:")))
             .expect("prompt is live");
         let after = rule
-            .live_match(&Screen::new("status 10:00:01\nPassword:"))
+            .live_match(rule.last_match(&Screen::new("status 10:00:01\nPassword:")))
             .expect("prompt is still live");
 
         assert_eq!(before.below, 0, "the prompt is the tail in both");
@@ -477,9 +480,11 @@ status line | 115200 8N1 | Offline";
         // still there", so this daemon errs towards not re-sending. Re-arming
         // happens when the tail moves on - see the two tests below.
         let rule = compiled("^login: *([^ A-Za-z0-9]|$)", Some(2));
-        let first = rule.live_match(&Screen::new("banner\nlogin:")).unwrap();
+        let first = rule
+            .live_match(rule.last_match(&Screen::new("banner\nlogin:")))
+            .unwrap();
         let again = rule
-            .live_match(&Screen::new("banner\nlogin: someuser\nlogin:"))
+            .live_match(rule.last_match(&Screen::new("banner\nlogin: someuser\nlogin:")))
             .unwrap();
         assert_eq!(
             first.signature(),
@@ -494,11 +499,12 @@ status line | 115200 8N1 | Offline";
         // matches at the tail at all - that is what clears the latch.
         let rule = compiled("^login: *([^ A-Za-z0-9]|$)", Some(2));
         assert!(
-            rule.live_match(&Screen::new("banner\nlogin:")).is_some(),
+            rule.live_match(rule.last_match(&Screen::new("banner\nlogin:")))
+                .is_some(),
             "the bare prompt matches"
         );
         assert!(
-            rule.live_match(&Screen::new("banner\nlogin: someuser"))
+            rule.live_match(rule.last_match(&Screen::new("banner\nlogin: someuser")))
                 .is_none(),
             "an answered prompt does not match, which re-arms the rule"
         );
@@ -507,8 +513,12 @@ status line | 115200 8N1 | Offline";
     #[test]
     fn a_different_prompt_is_a_different_occurrence() {
         let rule = compiled("^(login|Password):", None);
-        let login = rule.live_match(&Screen::new("login:")).unwrap();
-        let password = rule.live_match(&Screen::new("Password:")).unwrap();
+        let login = rule
+            .live_match(rule.last_match(&Screen::new("login:")))
+            .unwrap();
+        let password = rule
+            .live_match(rule.last_match(&Screen::new("Password:")))
+            .unwrap();
         assert_ne!(
             login.signature(),
             password.signature(),
@@ -520,8 +530,14 @@ status line | 115200 8N1 | Offline";
     fn the_same_prompt_still_sitting_there_keeps_its_signature() {
         let rule = compiled("^Password:", Some(2));
         let screen = "banner\nPassword:";
-        let a = rule.live_match(&Screen::new(screen)).unwrap().signature();
-        let b = rule.live_match(&Screen::new(screen)).unwrap().signature();
+        let a = rule
+            .live_match(rule.last_match(&Screen::new(screen)))
+            .unwrap()
+            .signature();
+        let b = rule
+            .live_match(rule.last_match(&Screen::new(screen)))
+            .unwrap()
+            .signature();
         assert_eq!(a, b, "an unchanged screen must not look like a new prompt");
     }
 
@@ -529,21 +545,23 @@ status line | 115200 8N1 | Offline";
     fn blank_lines_do_not_push_a_prompt_away_from_the_tail() {
         let rule = compiled("^Password:", Some(1));
         assert!(rule
-            .live_match(&Screen::new("Password:\n\n   \n\n"))
+            .live_match(rule.last_match(&Screen::new("Password:\n\n   \n\n")))
             .is_some());
     }
 
     #[test]
     fn a_rule_without_tail_within_matches_anywhere() {
         let rule = compiled("^Password:", None);
-        assert!(rule.live_match(&Screen::new(ANSWERED)).is_some());
+        assert!(rule
+            .live_match(rule.last_match(&Screen::new(ANSWERED)))
+            .is_some());
     }
 
     #[test]
     fn tail_within_declines_when_there_is_no_screen_to_judge() {
         let rule = compiled("^Password:", Some(2));
         assert!(
-            rule.live_match(&Screen::new("")).is_none(),
+            rule.live_match(rule.last_match(&Screen::new(""))).is_none(),
             "without a screen a credential rule must fail safe"
         );
     }
