@@ -13,14 +13,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
-
 use crate::actions::{self, Context};
-use crate::client::Client;
 use crate::config::{self, Settings, TriggersConfig};
 use crate::rules::{CompiledRule, FireGuard, Ledger, Screen};
+use crate::server::{PaneInfo, Server, ServerError};
 use crate::{log_detail, log_line};
 
 /// Each poll lists panes (and labels for title scopes) and reads watched screens, so
@@ -37,42 +36,8 @@ pub static STOP: AtomicBool = AtomicBool::new(false);
 pub static RELOAD: AtomicBool = AtomicBool::new(false);
 pub static RESET: AtomicBool = AtomicBool::new(false);
 
-#[derive(Debug, Clone)]
-pub struct PaneInfo {
-    pub pane_id: String,
-    /// Unique per pane instance and stable for its life. Unlike `pane_id`
-    /// (a per-workspace counter herdr restarts from 1 each launch), this is
-    /// never reused, so the persistent once-ledger keys on it: a pane that
-    /// takes a recycled public id after a herdr restart does not inherit the
-    /// old pane's fired state.
-    pub terminal_id: String,
-    pub tab_id: String,
-    pub workspace_id: String,
-    /// Every name this pane can be known by: a manual `pane rename` label, an
-    /// agent-set title, the terminal's own title, and the labels of its TAB and
-    /// its WORKSPACE - the last two also with any `[N] ` position prefix
-    /// stripped. `scope.pane_title` matches if ANY of them does, because which
-    /// one carries the identity depends on what is running in the pane: a
-    /// full-screen client often sets no title at all, leaving only the tab or
-    /// workspace name.
-    pub titles: Vec<String>,
-}
-
-impl PaneInfo {
-    /// The id the persistent ledger keys on: the never-reused terminal id when
-    /// herdr reports one, else the public pane id (older herdr, or a pane still
-    /// reported without the field).
-    fn ledger_id(&self) -> &str {
-        if self.terminal_id.is_empty() {
-            &self.pane_id
-        } else {
-            &self.terminal_id
-        }
-    }
-}
-
 pub struct Engine {
-    client: Client,
+    server: Arc<dyn Server>,
     triggers_path: PathBuf,
     secrets_path: PathBuf,
     rules: Vec<CompiledRule>,
@@ -100,17 +65,22 @@ pub struct Engine {
     /// again. A rule left armed after a failure must not retry at poll rate.
     retries: HashMap<String, u32>,
     retry_after: HashMap<String, std::time::Instant>,
+    /// The last "watching N rule/pane pairs" report, so it is logged on
+    /// change rather than every poll.
+    announced: Option<(usize, usize)>,
+    /// Whether the last poll hit the watched-pane cap, reported on change.
+    capped: bool,
 }
 
 impl Engine {
-    pub fn new(client: Client, config_dir: &Path, state_dir: &Path) -> Self {
+    pub fn new(server: Arc<dyn Server>, config_dir: &Path, state_dir: &Path) -> Self {
         let triggers_path = config_dir.join("triggers.toml");
         let secrets_path = config_dir.join("secrets.toml");
         let ledger = Ledger::load(&state_dir.join("once-ledger.json"));
         let settings = Settings::default();
         let guard = FireGuard::new(settings.cooldown_ms, settings.max_writes_per_second);
         let mut engine = Self {
-            client,
+            server,
             triggers_path,
             secrets_path,
             rules: Vec::new(),
@@ -124,6 +94,8 @@ impl Engine {
             reported_held: HashMap::new(),
             retries: HashMap::new(),
             retry_after: HashMap::new(),
+            announced: None,
+            capped: false,
         };
         engine.reload();
         engine
@@ -189,8 +161,6 @@ impl Engine {
 
     pub fn run(&mut self) {
         let mut backoff = INITIAL_BACKOFF;
-        let mut announced: Option<(usize, usize)> = None;
-        let mut capped = false;
         while !STOP.load(Ordering::Relaxed) {
             self.drain_control_flags();
 
@@ -199,93 +169,100 @@ impl Engine {
                 continue;
             }
 
-            let panes = match self.panes() {
-                Ok(panes) => panes,
+            match self.poll() {
+                Ok(()) => backoff = INITIAL_BACKOFF,
+                Err(err) if self.server.is_fatal(&err) => {
+                    log_line!("server is gone ({err}); exiting");
+                    return;
+                }
                 Err(err) => {
-                    log_line!("cannot reach herdr ({err}); retrying");
-                    announced = None;
+                    log_line!("cannot reach the server ({err}); retrying");
+                    self.announced = None;
                     sleep_interruptibly(backoff);
                     backoff = next_backoff(backoff);
                     continue;
                 }
-            };
-            backoff = INITIAL_BACKOFF;
-
-            // Drop state for terminals that are gone. The ledger keys on
-            // terminal ids (restart-safe), the in-memory guards on pane ids.
-            let live_terminals: HashSet<&str> = panes.iter().map(PaneInfo::ledger_id).collect();
-            let live_panes: HashSet<&str> =
-                panes.iter().map(|pane| pane.pane_id.as_str()).collect();
-            self.ledger.retain_panes(&live_terminals);
-            self.guard.retain_panes(&live_panes);
-            let alive = |key: &String| {
-                key.split('\t')
-                    .nth(1)
-                    .is_some_and(|pane| live_panes.contains(pane))
-            };
-            self.latched.retain(|key, _| alive(key));
-            self.known.retain(alive);
-            self.reported_stale.retain(|key, _| alive(key));
-            self.reported_held.retain(|key, _| alive(key));
-            self.retries.retain(|key, _| alive(key));
-            self.retry_after.retain(|key, _| alive(key));
-            self.read_failures
-                .borrow_mut()
-                .retain(|pane| live_panes.contains(pane.as_str()));
-
-            // Panes a SCOPED rule wants come first. The cap exists to bound
-            // an unscoped rule set, and must never spend the budget on a pane
-            // matched only by a broad rule while starving one a credential rule
-            // was aimed at.
-            let ordered = watched_rules(&self.rules, &panes);
-
-            let mut watched = 0usize;
-            let mut watched_panes = 0usize;
-            let mut over_cap = false;
-            for (pane, applicable) in ordered {
-                watched_panes += 1;
-                if watched_panes > MAX_WATCHED_PANES {
-                    over_cap = true;
-                    break;
-                }
-                watched += applicable.len();
-                // One read per pane per poll, and one pass over its lines,
-                // both shared by every rule on that pane.
-                let Some(text) = self.read_pane(&pane.pane_id) else {
-                    continue;
-                };
-                let screen = Screen::new(&text);
-                // A blank screen is still evaluated: it means the pane was
-                // cleared, nothing matches at the tail, and every rule on it
-                // must drop its latch - otherwise `clear` could never re-arm a
-                // rule. Skipping this was why a cleared prompt stayed stuck.
-                for index in applicable {
-                    self.evaluate(index, pane, &text, &screen);
-                }
-            }
-            if over_cap != capped {
-                if over_cap {
-                    log_line!(
-                        "more than {MAX_WATCHED_PANES} panes match a rule; the rest are not \
-                         watched - add a scope"
-                    );
-                }
-                capped = over_cap;
-            }
-            // Report on change, not once: panes come and go and scopes start
-            // matching, and a stale "watching N" line is misleading.
-            if announced != Some((watched, panes.len())) {
-                log_line!(
-                    "watching {watched} rule/pane pairs across {} panes every {}ms",
-                    panes.len(),
-                    self.poll_interval().as_millis()
-                );
-                announced = Some((watched, panes.len()));
             }
 
             sleep_interruptibly(self.poll_interval());
         }
         log_line!("stopping");
+    }
+
+    /// One pass: list the panes, read every watched one, evaluate its rules.
+    /// Pure with respect to time: the caller sleeps.
+    fn poll(&mut self) -> Result<(), ServerError> {
+        let panes = self.server.panes(self.needs_labels())?;
+
+        // Drop state for terminals that are gone. The ledger keys on
+        // terminal ids (restart-safe), the in-memory guards on pane ids.
+        let live_terminals: HashSet<&str> = panes.iter().map(PaneInfo::ledger_id).collect();
+        let live_panes: HashSet<&str> = panes.iter().map(|pane| pane.pane_id.as_str()).collect();
+        self.ledger.retain_panes(&live_terminals);
+        self.guard.retain_panes(&live_panes);
+        let alive = |key: &String| {
+            key.split('\t')
+                .nth(1)
+                .is_some_and(|pane| live_panes.contains(pane))
+        };
+        self.latched.retain(|key, _| alive(key));
+        self.known.retain(alive);
+        self.reported_stale.retain(|key, _| alive(key));
+        self.reported_held.retain(|key, _| alive(key));
+        self.retries.retain(|key, _| alive(key));
+        self.retry_after.retain(|key, _| alive(key));
+        self.read_failures
+            .borrow_mut()
+            .retain(|pane| live_panes.contains(pane.as_str()));
+
+        // Panes a SCOPED rule wants come first. The cap exists to bound an
+        // unscoped rule set, and must never spend the budget on a pane matched
+        // only by a broad rule while starving one a credential rule was aimed at.
+        let ordered = watched_rules(&self.rules, &panes);
+
+        let mut watched = 0usize;
+        let mut watched_panes = 0usize;
+        let mut over_cap = false;
+        for (pane, applicable) in ordered {
+            watched_panes += 1;
+            if watched_panes > MAX_WATCHED_PANES {
+                over_cap = true;
+                break;
+            }
+            watched += applicable.len();
+            // One read per pane per poll, and one pass over its lines, both
+            // shared by every rule on that pane.
+            let Some(text) = self.read_pane(&pane.pane_id) else {
+                continue;
+            };
+            let screen = Screen::new(&text);
+            // A blank screen is still evaluated: it means the pane was cleared,
+            // nothing matches at the tail, and every rule on it must drop its
+            // latch - otherwise `clear` could never re-arm a rule.
+            for index in applicable {
+                self.evaluate(index, pane, &text, &screen);
+            }
+        }
+        if over_cap != self.capped {
+            if over_cap {
+                log_line!(
+                    "more than {MAX_WATCHED_PANES} panes match a rule; the rest are not \
+                     watched - add a scope"
+                );
+            }
+            self.capped = over_cap;
+        }
+        // Report on change, not once: panes come and go and scopes start
+        // matching, and a stale "watching N" line is misleading.
+        if self.announced != Some((watched, panes.len())) {
+            log_line!(
+                "watching {watched} rule/pane pairs across {} panes every {}ms",
+                panes.len(),
+                self.poll_interval().as_millis()
+            );
+            self.announced = Some((watched, panes.len()));
+        }
+        Ok(())
     }
 
     fn poll_interval(&self) -> Duration {
@@ -301,160 +278,21 @@ impl Engine {
         }
     }
 
-    /// Tab id -> label, in one request. The names a user actually sees and
-    /// types (`usb0`, `monitor`) are TAB labels, not pane attributes: a pane's
-    /// own title is usually just the shell's (`user@host: ~`). A scope written
-    /// against the visible name has to be able to match the tab.
-    fn tab_labels(&self) -> HashMap<String, String> {
-        let Ok(result) = self.client.request("tab.list", json!({})) else {
-            return HashMap::new();
-        };
-        result
-            .get("tabs")
-            .and_then(Value::as_array)
-            .map(|tabs| {
-                tabs.iter()
-                    .filter_map(|tab| {
-                        let id = tab.get("tab_id")?.as_str()?.to_string();
-                        let label = tab.get("label")?.as_str()?.to_string();
-                        Some((id, label))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Workspace id -> label, in one request. A workspace carries a name too
-    /// (`monitor`), and for a pane whose tab is just `bash` that name is the
-    /// only thing identifying where it is.
-    fn workspace_labels(&self) -> HashMap<String, String> {
-        let Ok(result) = self.client.request("workspace.list", json!({})) else {
-            return HashMap::new();
-        };
-        result
-            .get("workspaces")
-            .and_then(Value::as_array)
-            .map(|spaces| {
-                spaces
-                    .iter()
-                    .filter_map(|space| {
-                        let id = space.get("workspace_id")?.as_str()?.to_string();
-                        let label = space.get("label")?.as_str()?.to_string();
-                        Some((id, label))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn panes(&self) -> Result<Vec<PaneInfo>, crate::client::ClientError> {
-        let result = self.client.request("pane.list", json!({}))?;
-        let needs_labels = self.rules.iter().any(|rule| {
+    /// Tab and workspace names cost a host extra calls; only a `pane_title`
+    /// scope can use them.
+    fn needs_labels(&self) -> bool {
+        self.rules.iter().any(|rule| {
             rule.scope
                 .as_ref()
                 .is_some_and(|scope| scope.pane_title.is_some())
-        });
-        let (tabs, spaces) = if needs_labels {
-            (self.tab_labels(), self.workspace_labels())
-        } else {
-            (HashMap::new(), HashMap::new())
-        };
-        let panes = result
-            .get("panes")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                crate::client::ClientError::Malformed("pane.list has no panes".into())
-            })?;
-        Ok(panes
-            .iter()
-            .filter_map(|pane| {
-                Some(PaneInfo {
-                    pane_id: pane.get("pane_id")?.as_str()?.to_string(),
-                    terminal_id: pane
-                        .get("terminal_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    tab_id: pane
-                        .get("tab_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    workspace_id: pane
-                        .get("workspace_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    titles: {
-                        let mut titles: Vec<String> = [
-                            "label",
-                            "title",
-                            "terminal_title_stripped",
-                            "terminal_title",
-                        ]
-                        .iter()
-                        .filter_map(|field| pane.get(*field).and_then(Value::as_str))
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                        // The tab's and the workspace's labels too: those are the
-                        // names on screen. A pane's own title is usually just
-                        // the shell's, and its tab may only say "bash".
-                        let mut add = |label: &String| {
-                            titles.push(label.clone());
-                            // herdr decorates a label with its position
-                            // ("[1] monitor"), so match the bare name as well
-                            // and a scope need not track reordering.
-                            if let Some(bare) = strip_tab_number(label) {
-                                titles.push(bare.to_string());
-                            }
-                        };
-                        if let Some(label) = pane
-                            .get("tab_id")
-                            .and_then(Value::as_str)
-                            .and_then(|id| tabs.get(id))
-                        {
-                            add(label);
-                        }
-                        if let Some(label) = pane
-                            .get("workspace_id")
-                            .and_then(Value::as_str)
-                            .and_then(|id| spaces.get(id))
-                        {
-                            add(label);
-                        }
-                        titles
-                    },
-                })
-            })
-            .collect())
+        })
     }
 
     fn read_pane(&self, pane_id: &str) -> Option<String> {
-        let mut params = json!({
-            "pane_id": pane_id,
-            "source": self.settings.source,
-            "strip_ansi": true,
-        });
-        if let Some(lines) = self.settings.lines {
-            params["lines"] = json!(lines);
-        }
-        let result = self
-            .client
-            .request("pane.read", params)
-            .and_then(|mut result| {
-                match result
-                    .get_mut("read")
-                    .and_then(|read| read.get_mut("text"))
-                    .map(Value::take)
-                {
-                    Some(Value::String(text)) => Ok(text),
-                    _ => Err(crate::client::ClientError::Malformed(
-                        "pane.read has no text".into(),
-                    )),
-                }
-            });
-        match result {
+        match self
+            .server
+            .read(pane_id, &self.settings.source, self.settings.lines)
+        {
             Ok(text) => {
                 self.read_failures.borrow_mut().remove(pane_id);
                 Some(text)
@@ -575,7 +413,7 @@ impl Engine {
             }
         }
 
-        let outcome = actions::run(&self.client, &self.rules[index], &context);
+        let outcome = actions::run(&self.server, &self.rules[index], &context);
         // Tokens are spent only now, after the action has actually run: a fire
         // that was never attempted must not consume the retry's budget.
         self.guard.record(&id, pane_id, matched_line);
@@ -678,17 +516,6 @@ fn poll_interval_for(poll_ms: u64) -> Duration {
     Duration::from_millis(poll_ms.clamp(50, 60_000))
 }
 
-/// Strips herdr's `[N] ` tab-number decoration, so a scope can match the name
-/// the user gave the tab regardless of where it sits.
-fn strip_tab_number(label: &str) -> Option<&str> {
-    let rest = label.strip_prefix('[')?;
-    let (number, rest) = rest.split_once("] ")?;
-    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some(rest)
-}
-
 fn armed_key(rule_id: &str, pane_id: &str) -> String {
     format!("{rule_id}\t{pane_id}")
 }
@@ -720,6 +547,7 @@ fn sleep_interruptibly(total: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
 
     fn rule(scope: Option<config::Scope>) -> CompiledRule {
         CompiledRule::compile(&config::Rule {
@@ -798,7 +626,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
         });
-        let mut engine = Engine::new(Client::new(socket), &root, &root);
+        let mut engine = Engine::new(Arc::new(crate::client::Client::new(socket)), &root, &root);
         engine.rules = rules;
         check(&mut engine);
         finished.send(()).unwrap();
@@ -886,7 +714,10 @@ mod tests {
             rules,
             vec![("pane.list", json!({"panes": [{"pane_id": "w1:p1"}]}))],
             |engine| {
-                assert_eq!(engine.panes().unwrap()[0].pane_id, "w1:p1");
+                assert_eq!(
+                    engine.server.panes(engine.needs_labels()).unwrap()[0].pane_id,
+                    "w1:p1"
+                );
             },
         );
     }
@@ -914,7 +745,7 @@ mod tests {
                 ),
             ],
             |engine| {
-                let panes = engine.panes().unwrap();
+                let panes = engine.server.panes(engine.needs_labels()).unwrap();
                 assert!(panes[0].titles.iter().any(|s| s == "monitor"));
                 assert!(panes[0].titles.iter().any(|s| s == "console"));
                 assert_eq!(watched_rules(&engine.rules, &panes).len(), 1);
@@ -964,11 +795,29 @@ mod tests {
 
     #[test]
     fn tab_number_decoration_is_stripped_so_a_scope_can_match_the_name() {
-        assert_eq!(strip_tab_number("[3] monitor"), Some("monitor"));
-        assert_eq!(strip_tab_number("[12] voip fh"), Some("voip fh"));
-        assert_eq!(strip_tab_number("monitor"), None, "no decoration to strip");
-        assert_eq!(strip_tab_number("[x] monitor"), None, "not a tab number");
-        assert_eq!(strip_tab_number("[3]monitor"), None, "needs the space");
+        assert_eq!(
+            crate::server::strip_tab_number("[3] monitor"),
+            Some("monitor")
+        );
+        assert_eq!(
+            crate::server::strip_tab_number("[12] voip fh"),
+            Some("voip fh")
+        );
+        assert_eq!(
+            crate::server::strip_tab_number("monitor"),
+            None,
+            "no decoration to strip"
+        );
+        assert_eq!(
+            crate::server::strip_tab_number("[x] monitor"),
+            None,
+            "not a tab number"
+        );
+        assert_eq!(
+            crate::server::strip_tab_number("[3]monitor"),
+            None,
+            "needs the space"
+        );
     }
 
     #[test]
@@ -983,5 +832,93 @@ mod tests {
             Duration::from_millis(60_000),
             "ceiling"
         );
+    }
+
+    /// A server with scripted panes and screens that records what was typed.
+    struct FakeServer {
+        panes: Vec<PaneInfo>,
+        screens: std::sync::Mutex<HashMap<String, String>>,
+        typed: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl Server for FakeServer {
+        fn describe(&self) -> String {
+            "fake".into()
+        }
+        fn panes(&self, _with_labels: bool) -> Result<Vec<PaneInfo>, ServerError> {
+            Ok(self.panes.clone())
+        }
+        fn read(
+            &self,
+            pane_id: &str,
+            _source: &str,
+            _lines: Option<u32>,
+        ) -> Result<String, ServerError> {
+            Ok(self
+                .screens
+                .lock()
+                .unwrap()
+                .get(pane_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+        fn send_text(&self, pane_id: &str, text: &str) -> Result<(), ServerError> {
+            self.typed
+                .lock()
+                .unwrap()
+                .push((pane_id.into(), text.into()));
+            Ok(())
+        }
+        fn tab_label(&self, _tab_id: &str) -> Result<String, ServerError> {
+            Ok("tab".into())
+        }
+        fn rename_tab(&self, _tab_id: &str, _label: &str) -> Result<(), ServerError> {
+            Ok(())
+        }
+        fn notify(&self, _n: &crate::server::Notification<'_>) -> Result<String, ServerError> {
+            Ok("shown".into())
+        }
+    }
+
+    #[test]
+    fn a_rule_fires_once_through_the_trait_and_latches_on_the_same_prompt() {
+        let fake = Arc::new(FakeServer {
+            panes: vec![pane("p1")],
+            screens: std::sync::Mutex::new(HashMap::from([(
+                "p1".to_string(),
+                "login\nPassword:".to_string(),
+            )])),
+            typed: std::sync::Mutex::new(Vec::new()),
+        });
+        let root = std::env::temp_dir().join(format!("triggers-fake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut engine = Engine::new(fake.clone(), &root, &root);
+        engine.rules = vec![rule(None)];
+        engine.settings.fire_on_existing_text = true;
+        // No cooldown: identical text within it is held, and this test is
+        // about the latch, not the clock.
+        engine.guard = FireGuard::new(0, 1000);
+
+        engine.poll().unwrap();
+        engine.poll().unwrap();
+        assert_eq!(
+            *fake.typed.lock().unwrap(),
+            vec![("p1".to_string(), "fixture".to_string())]
+        );
+
+        // The prompt is answered and scrolls away, then a fresh one appears.
+        fake.screens
+            .lock()
+            .unwrap()
+            .insert("p1".into(), "ok\n$ ".into());
+        engine.poll().unwrap();
+        fake.screens
+            .lock()
+            .unwrap()
+            .insert("p1".into(), "ok\nPassword:".into());
+        engine.poll().unwrap();
+        assert_eq!(fake.typed.lock().unwrap().len(), 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

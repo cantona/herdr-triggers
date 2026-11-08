@@ -132,10 +132,6 @@ impl Client {
         Self::new(socket_path())
     }
 
-    pub fn path(&self) -> &PathBuf {
-        &self.path
-    }
-
     /// One request, one response, one connection.
     pub fn request(&self, method: &str, params: Value) -> Result<Value, ClientError> {
         let mut stream = UnixStream::connect(&self.path)?;
@@ -172,6 +168,187 @@ impl Client {
             .get_mut("result")
             .map(Value::take)
             .unwrap_or(Value::Null))
+    }
+}
+
+impl crate::server::Server for Client {
+    fn describe(&self) -> String {
+        self.path.display().to_string()
+    }
+
+    fn panes(
+        &self,
+        with_labels: bool,
+    ) -> Result<Vec<crate::server::PaneInfo>, crate::server::ServerError> {
+        use crate::server::{strip_tab_number, PaneInfo};
+        use std::collections::HashMap;
+        let result = self.request("pane.list", json!({}))?;
+        let (tabs, spaces) = if with_labels {
+            (
+                self.labels("tab.list", "tabs", "tab_id"),
+                self.labels("workspace.list", "workspaces", "workspace_id"),
+            )
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+        let panes = result
+            .get("panes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ClientError::Malformed("pane.list has no panes".into()))?;
+        Ok(panes
+            .iter()
+            .filter_map(|pane| {
+                let field = |name: &str| {
+                    pane.get(name)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let mut titles: Vec<String> = [
+                    "label",
+                    "title",
+                    "terminal_title_stripped",
+                    "terminal_title",
+                ]
+                .iter()
+                .filter_map(|name| pane.get(*name).and_then(Value::as_str))
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect();
+                // The tab's and the workspace's labels too: those are the names
+                // on screen. A pane's own title is usually just the shell's, and
+                // its tab may only say "bash". herdr decorates a label with its
+                // position ("[1] monitor"), so the bare name is added as well.
+                for label in [
+                    tabs.get(&field("tab_id")),
+                    spaces.get(&field("workspace_id")),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    titles.push(label.clone());
+                    if let Some(bare) = strip_tab_number(label) {
+                        titles.push(bare.to_string());
+                    }
+                }
+                Some(PaneInfo {
+                    pane_id: pane.get("pane_id")?.as_str()?.to_string(),
+                    terminal_id: field("terminal_id"),
+                    tab_id: field("tab_id"),
+                    workspace_id: field("workspace_id"),
+                    titles,
+                })
+            })
+            .collect())
+    }
+
+    fn read(
+        &self,
+        pane_id: &str,
+        source: &str,
+        lines: Option<u32>,
+    ) -> Result<String, crate::server::ServerError> {
+        let mut params = json!({"pane_id": pane_id, "source": source, "strip_ansi": true});
+        if let Some(lines) = lines {
+            params["lines"] = json!(lines);
+        }
+        let mut result = self.request("pane.read", params)?;
+        match result
+            .get_mut("read")
+            .and_then(|read| read.get_mut("text"))
+            .map(Value::take)
+        {
+            Some(Value::String(text)) => Ok(text),
+            _ => Err(ClientError::Malformed("pane.read has no text".into()).into()),
+        }
+    }
+
+    fn send_text(&self, pane_id: &str, text: &str) -> Result<(), crate::server::ServerError> {
+        self.request("pane.send_text", json!({"pane_id": pane_id, "text": text}))?;
+        Ok(())
+    }
+
+    fn tab_label(&self, tab_id: &str) -> Result<String, crate::server::ServerError> {
+        // Not `labels()`: a failed tab.list must fail the mark rather than
+        // read as an empty name, which would rename the tab to the marker.
+        let tabs = self.request("tab.list", json!({}))?;
+        let label = tabs
+            .get("tabs")
+            .and_then(Value::as_array)
+            .and_then(|tabs| {
+                tabs.iter()
+                    .find(|tab| tab.get("tab_id").and_then(Value::as_str) == Some(tab_id))
+            })
+            .and_then(|tab| tab.get("label"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok(crate::server::strip_tab_number(&label)
+            .unwrap_or(&label)
+            .to_string())
+    }
+
+    fn rename_tab(&self, tab_id: &str, label: &str) -> Result<(), crate::server::ServerError> {
+        self.request("tab.rename", json!({"tab_id": tab_id, "label": label}))?;
+        Ok(())
+    }
+
+    fn notify(
+        &self,
+        n: &crate::server::Notification<'_>,
+    ) -> Result<String, crate::server::ServerError> {
+        let mut params = json!({"title": n.title});
+        if let Some(body) = n.body {
+            params["body"] = json!(body);
+        }
+        if let Some(sound) = n.sound {
+            params["sound"] = json!(sound);
+        }
+        if let Some(position) = n.position {
+            params["position"] = json!(position);
+        }
+        let result = self.request("notification.show", params)?;
+        // Raised as well as the toast, not instead of it: this is the only
+        // way to get a notification that outlives herdr's fixed 3 seconds.
+        if let Some(urgency) = n.desktop {
+            if let Err(err) = crate::server::raise_desktop_notification(urgency, n.title, n.body) {
+                crate::log_line!("{err}");
+            }
+        }
+        Ok(result
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string())
+    }
+}
+
+impl Client {
+    /// `<id_field>` -> `label` for one list call; empty when the call fails,
+    /// since a missing name only narrows what a scope can match.
+    fn labels(
+        &self,
+        method: &str,
+        array: &str,
+        id_field: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let Ok(result) = self.request(method, json!({})) else {
+            return std::collections::HashMap::new();
+        };
+        result
+            .get(array)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let id = item.get(id_field)?.as_str()?.to_string();
+                        let label = item.get("label")?.as_str()?.to_string();
+                        Some((id, label))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 

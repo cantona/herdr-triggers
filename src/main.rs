@@ -10,6 +10,7 @@ mod config;
 mod engine;
 mod log;
 mod rules;
+mod server;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -329,13 +330,13 @@ fn daemon_main() {
     write_pidfile();
     install_signal_handlers();
 
-    let client = Client::from_env();
+    let server: std::sync::Arc<dyn server::Server> = std::sync::Arc::new(Client::from_env());
     log_line!(
         "herdr-triggersd {} starting (socket {})",
         env!("CARGO_PKG_VERSION"),
-        client.path().display()
+        server.describe()
     );
-    let mut engine = engine::Engine::new(client, &config_dir(), &state_dir);
+    let mut engine = engine::Engine::new(server, &config_dir(), &state_dir);
     engine.run();
     let _ = std::fs::remove_file(pid_path());
 }

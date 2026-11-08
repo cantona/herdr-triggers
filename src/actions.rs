@@ -11,11 +11,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use std::sync::Arc;
 
-use crate::client::{Client, ClientError};
 use crate::config::{Action, ConfigError};
 use crate::rules::CompiledRule;
+use crate::server::{Notification, Server, ServerError};
 
 /// A coprocess gets 10 seconds before giving up on it.
 const COPROCESS_DEADLINE: Duration = Duration::from_secs(10);
@@ -42,7 +42,7 @@ pub struct Context<'a> {
 
 #[derive(Debug)]
 pub enum ActionError {
-    Client(ClientError),
+    Server(ServerError),
     Secrets(ConfigError),
     UnknownSecret(String),
     SecretNotAllowed(String, &'static str),
@@ -67,7 +67,7 @@ impl ActionError {
 impl std::fmt::Display for ActionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ActionError::Client(err) => write!(f, "{err}"),
+            ActionError::Server(err) => write!(f, "{err}"),
             ActionError::Secrets(err) => write!(f, "secrets unavailable: {err}"),
             ActionError::UnknownSecret(name) => {
                 write!(f, "secrets.toml has no entry named {name}")
@@ -174,19 +174,16 @@ fn secret(name: &str, context: &Context<'_>) -> Result<String, ActionError> {
 /// Runs the action. The returned string is safe to log: it never contains an
 /// expanded secret.
 pub fn run(
-    client: &Client,
+    server: &Arc<dyn Server>,
     rule: &CompiledRule,
     context: &Context<'_>,
 ) -> Result<String, ActionError> {
     match &rule.action {
         Action::SendText { text } => {
             let expanded = expand(text, rule, context)?;
-            client
-                .request(
-                    "pane.send_text",
-                    json!({"pane_id": context.pane_id, "text": expanded}),
-                )
-                .map_err(ActionError::Client)?;
+            server
+                .send_text(context.pane_id, &expanded)
+                .map_err(ActionError::Server)?;
             // Deliberately not the byte count: for a credential rule that is
             // the password's length, and `triggers-status` prints the log.
             Ok("send_text".to_string())
@@ -204,40 +201,25 @@ pub fn run(
                 .as_deref()
                 .map(|body| expand_with(body, rule, context, refuse))
                 .transpose()?;
-            let mut params = json!({"title": title});
-            if let Some(body) = body.as_deref() {
-                params["body"] = json!(body);
-            }
-            if let Some(sound) = sound {
-                params["sound"] = json!(sound);
-            }
-            if let Some(position) = position {
-                params["position"] = json!(position);
-            }
-            let result = client
-                .request("notification.show", params)
-                .map_err(ActionError::Client)?;
-            // Raised as well as the toast, not instead of it: this is the only
-            // way to get a notification that outlives herdr's fixed 3 seconds.
-            //
-            // The expanded title and body become notify-send's argv, and
-            // /proc/<pid>/cmdline is world-readable for the life of that
-            // process. `${secret:}` cannot get here - it is refused at load -
-            // but `${match}` and `$1`..`$9` carry whatever the pane printed,
-            // so a rule matching a line that happens to contain a credential
-            // would expose it. Hence the load-time warning on this pairing.
-            if let Some(urgency) = desktop {
-                raise_desktop_notification(urgency, &title, body.as_deref());
-            }
+            // The server raises the desktop notification too when `desktop`
+            // is set, so the action has no host-specific branch. Its title and
+            // body become argv, world-readable in /proc while it runs: hence
+            // the load-time warning on `desktop` with `${match}`.
+            let reason = server
+                .notify(&Notification {
+                    title: &title,
+                    body: body.as_deref(),
+                    sound: sound.as_deref(),
+                    position: position.as_deref(),
+                    desktop: desktop.as_deref(),
+                })
+                .map_err(ActionError::Server)?;
             // herdr accepts the call and then decides whether to show it, so a
             // plain OK here means nothing. Reporting the reason is the
             // difference between "the rule works" and "the rule works and you
             // will never see it": with herdr's default delivery = off every
             // notification is discarded.
-            let reason = result
-                .get("reason")
-                .and_then(|reason| reason.as_str())
-                .unwrap_or("unknown");
+            let reason = reason.as_str();
             Ok(match reason {
                 "shown" => "notify shown".to_string(),
                 "disabled" => "notify DISCARDED: set [ui.toast] delivery = \"herdr\" in herdr's \
@@ -253,13 +235,10 @@ pub fn run(
                 context,
                 Secrets::Refuse("a tab label, which herdr persists to disk"),
             )?;
-            let label = marked_label(client, context.tab_id, &marker)?;
-            client
-                .request(
-                    "tab.rename",
-                    json!({"tab_id": context.tab_id, "label": label}),
-                )
-                .map_err(ActionError::Client)?;
+            let label = marked_label(server.as_ref(), context.tab_id, &marker)?;
+            server
+                .rename_tab(context.tab_id, &label)
+                .map_err(ActionError::Server)?;
             Ok(format!("tab_mark {label}"))
         }
         Action::Run {
@@ -290,50 +269,9 @@ pub fn run(
                     .unwrap_or(screen.len());
                 screen[start..].to_string()
             });
-            spawn_coprocess(client, program, &args, rule, context, secrets, feed)?;
+            spawn_coprocess(server, program, &args, rule, context, secrets, feed)?;
             Ok(format!("coprocess {program}"))
         }
-    }
-}
-
-/// A desktop notification via libnotify's CLI.
-///
-/// "critical" ASKS the desktop to keep it until dismissed; whether it obeys is
-/// the notification server's choice. GNOME Shell, for one, ignores the expiry
-/// hint for how long a banner stays up and files the notification in its shade
-/// instead. A herdr toast cannot outlive 3 seconds at all, so this is still the
-/// longer-lived of the two - but `tab_mark` is the only indicator that
-/// genuinely persists, since it stays until the tab is renamed.
-fn raise_desktop_notification(urgency: &str, title: &str, body: Option<&str>) {
-    let mut command = Command::new("notify-send");
-    command
-        .arg("--app-name=herdr-triggers")
-        .arg(format!("--urgency={urgency}"));
-    if urgency == "critical" {
-        // 0 is libnotify's "never expire". It is a request: a notification
-        // server may cap or ignore it.
-        command.arg("--expire-time=0");
-    }
-    command.arg("--").arg(title);
-    if let Some(body) = body {
-        command.arg(body);
-    }
-    match command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        // Reap it, or a trigger that fires often leaves a zombie per fire.
-        Ok(mut child) => {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-        // notify-send is libnotify's CLI and exists on Linux/BSD desktops. On
-        // macOS there is no equivalent, so `desktop` is a no-op there; the rest
-        // of the plugin is portable.
-        Err(err) => crate::log_line!("cannot run notify-send (Linux only): {err}"),
     }
 }
 
@@ -349,45 +287,15 @@ fn expand_all(
         .collect()
 }
 
-fn marked_label(client: &Client, tab_id: &str, marker: &str) -> Result<String, ActionError> {
-    let tabs = client
-        .request("tab.list", json!({}))
-        .map_err(ActionError::Client)?;
-    let current = tabs
-        .get("tabs")
-        .and_then(|tabs| tabs.as_array())
-        .and_then(|tabs| {
-            tabs.iter()
-                .find(|tab| tab.get("tab_id").and_then(|id| id.as_str()) == Some(tab_id))
-        })
-        .and_then(|tab| tab.get("label"))
-        .and_then(|label| label.as_str())
-        .unwrap_or_default()
-        .to_string();
-
-    // herdr reports a label decorated with the tab number ("[1] bash"), and
-    // writing that straight back would bake the number into the stored label,
-    // one more copy per mark.
-    let current = strip_tab_number(&current);
-
+fn marked_label(server: &dyn Server, tab_id: &str, marker: &str) -> Result<String, ActionError> {
+    // The server strips the `[N] ` decoration: writing it straight back would
+    // bake the number into the stored label, one more copy per mark.
+    let current = server.tab_label(tab_id).map_err(ActionError::Server)?;
     // Re-marking a tab must not stack markers.
     if !marker.trim().is_empty() && current.contains(marker.trim()) {
-        return Ok(current.to_string());
+        return Ok(current);
     }
     Ok(format!("{marker}{current}"))
-}
-
-fn strip_tab_number(label: &str) -> &str {
-    let Some(rest) = label.strip_prefix('[') else {
-        return label;
-    };
-    let Some((number, rest)) = rest.split_once("] ") else {
-        return label;
-    };
-    if number.is_empty() || !number.chars().all(|character| character.is_ascii_digit()) {
-        return label;
-    }
-    rest
 }
 
 fn collect_secret_env(
@@ -433,7 +341,7 @@ fn spawn(
 /// the pane, the way an interactive answer would be typed. A login flow
 /// depends on this - the script reads the screen and answers the prompt.
 fn spawn_coprocess(
-    client: &Client,
+    server: &Arc<dyn Server>,
     program: &str,
     args: &[String],
     rule: &CompiledRule,
@@ -480,7 +388,7 @@ fn spawn_coprocess(
         rx
     });
 
-    let client = client.clone();
+    let server = Arc::clone(server);
     let pane_id = context.pane_id.to_string();
     let rule_id = rule.id.clone();
     std::thread::spawn(move || {
@@ -543,8 +451,8 @@ fn spawn_coprocess(
                 "coprocess for rule {rule_id}: output over {COPROCESS_FEED_MAX_BYTES} bytes, truncated"
             );
         }
-        match client.request("pane.send_text", json!({"pane_id": pane_id, "text": text})) {
-            Ok(_) => crate::log_line!("coprocess for rule {rule_id} answered the prompt"),
+        match server.send_text(&pane_id, &text) {
+            Ok(()) => crate::log_line!("coprocess for rule {rule_id} answered the prompt"),
             Err(err) => {
                 crate::log_line!("coprocess for rule {rule_id}: cannot type output back: {err}")
             }
@@ -693,15 +601,6 @@ mod tests {
             "hunter2",
             "send_text still expands: it goes to the pane, not to argv"
         );
-    }
-
-    #[test]
-    fn tab_number_decoration_is_not_baked_into_the_label() {
-        assert_eq!(strip_tab_number("[1] bash"), "bash");
-        assert_eq!(strip_tab_number("[12] OK bash"), "OK bash");
-        assert_eq!(strip_tab_number("bash"), "bash");
-        assert_eq!(strip_tab_number("[x] bash"), "[x] bash");
-        assert_eq!(strip_tab_number("[1]bash"), "[1]bash");
     }
 
     #[test]
