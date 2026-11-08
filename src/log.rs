@@ -143,7 +143,12 @@ fn rotate_if_needed(path: &Path) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
-    let start = text.len().saturating_sub(KEEP_ON_ROTATE_BYTES);
+    let mut start = text.len().saturating_sub(KEEP_ON_ROTATE_BYTES);
+    // A byte offset can fall inside a multi-byte character, and slicing
+    // there panics on the engine thread: step to the next boundary first.
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
     // Resume at a line boundary so the rotated log does not start mid-entry.
     let start = text[start..]
         .find('\n')
@@ -181,6 +186,24 @@ macro_rules! log_detail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_never_cuts_inside_a_character() {
+        let dir = std::env::temp_dir().join(format!("triggers-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("triggersd.log");
+        // Three-byte characters only, no newline: the keep offset cannot
+        // land on a boundary for every length, and there is no line to
+        // resume at.
+        let body = "\u{2500}".repeat((MAX_LOG_BYTES as usize) / 3 + 7);
+        for pad in 0..3 {
+            std::fs::write(&path, format!("{}{body}", "x".repeat(pad))).unwrap();
+            rotate_if_needed(&path);
+            let kept = std::fs::read_to_string(&path).unwrap();
+            assert!(kept.len() <= KEEP_ON_ROTATE_BYTES, "pad {pad}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn levels_parse_and_only_known_names_are_accepted() {
