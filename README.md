@@ -79,6 +79,21 @@ name is part of the path because several herdr servers can run at once and
 their pidfiles and locks must not collide; `triggers-status` prints the socket
 and state dir it resolved to.
 
+## Desktop app (herdr-core)
+
+The same daemon watches the Herdr desktop app's terminals, which live in
+herdr-core: `herdr-triggersd --host core ...`. `mods/herdr-triggers` is the
+app side: a dialog (`ctrl-alt-g`, `cmd-alt-g` on macOS) with the daemon's
+status and controls, and a sidebar block that starts the daemon with
+`--follow-app` when the window opens; such a daemon exits once the app has
+been closed for 10 s. `RECIPE.md` has the install
+steps and what differs on that host: notifications are desktop
+notifications, `tab_mark` needs the window open, and `[settings] source` is
+ignored. Rules, secrets and timing are shared code, so a `triggers.toml`
+behaves the same on both hosts. The app side reads it from
+`~/.config/herdr-triggers/`, usually a symlink to the plugin's config
+directory.
+
 ## Example: automated login
 
 One of many possible uses. Answer a device's `login:` and `Password:` prompts
@@ -222,8 +237,9 @@ visible rather than assumed. An unknown session name fails loudly.
 
 `reload` is the light option after editing rules — it re-reads them without
 dropping the once-ledger. `restart` is for after rebuilding the binary; it waits
-for the old daemon to release its lock before starting the new one, because
-`start` refuses while the lock is held.
+for the old daemon to release its lock before starting the new one. `stop`
+also returns only once the daemon has exited, and a `start` that finds one
+stopping waits for it: each waits up to 30 s, since a stop lands between rules.
 
 ## Rule schema
 
@@ -428,9 +444,14 @@ and that shapes the limits below.
 ## Testing
 
 ```bash
-cargo test                      # rule identity, ledger, dedup, secrets, expansion
+cargo test                      # unit tests, plus the daemon against a fake herdr-core
 ./scripts/integration-test.sh   # live: fake login pane against a running herdr
 ```
+
+`cargo test` includes `tests/core_integration.rs`, which runs the real binary
+with `--host core` against a fake herdr-core on a temporary socket: it checks
+the exact bytes a rule types, that `once` holds, that the poll loop never lists
+terminals, `status --json`, and that the daemon exits once the core is gone.
 
 The integration test splits a pane running a fake login script and checks five
 things: that the daemon answers both prompts, that `tab_mark` renames the tab,
