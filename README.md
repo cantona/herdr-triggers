@@ -61,8 +61,9 @@ build once, and again after every source change followed by
 
 ### Platforms
 
-Linux and macOS. Everything works on both except the `desktop` notification
-option, which shells out to `notify-send` and is therefore Linux only.
+Linux and macOS. The `desktop` notification option uses `notify-send` on
+Linux and `osascript` (Notification Center) on macOS, where urgency has no
+effect.
 
 ### How the daemon runs
 
@@ -281,7 +282,7 @@ which for a credential is the mistake worth catching early.
 | Action | Maps to |
 |---|---|
 | `send_text` | `pane.send_text` |
-| `notify` | `notification.show`, plus optional `sound`, `position`, and `desktop` for a desktop notification that can persist (`desktop` is Linux only — it uses `notify-send`) |
+| `notify` | `notification.show`, plus optional `sound`, `position`, and `desktop` for a desktop notification that can persist (`notify-send` on Linux, `osascript` on macOS) |
 | `run` | local subprocess |
 | `coprocess` | local subprocess fed the pane snapshot on stdin; its stdout is typed back into the pane, 10 s deadline (a timeout discards the output) |
 | `tab_mark` | `tab.rename` with a marker prefix — stands in for tab colouring, which herdr has no API for |

@@ -89,9 +89,9 @@ pub trait Server: Send + Sync {
     }
 }
 
-/// A desktop notification via libnotify's CLI, which exists on Linux and BSD
-/// desktops only. "critical" asks the desktop to keep it until dismissed;
-/// whether it obeys is the notification server's choice.
+/// A desktop notification: libnotify's CLI on Linux and BSD, Notification
+/// Center through osascript on macOS. "critical" asks the desktop to keep it
+/// until dismissed; whether it obeys is the notification server's choice.
 ///
 /// The title and body become argv, and /proc/<pid>/cmdline is world-readable
 /// for the life of that process: `${secret:}` cannot get here (refused at
@@ -120,6 +120,20 @@ pub fn raise_desktop_notification(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn desktop_notification_command(_urgency: &str, title: &str, body: Option<&str>) -> Command {
+    let quote = |text: &str| format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""));
+    let script = format!(
+        "display notification {} with title {}",
+        quote(body.unwrap_or("")),
+        quote(title)
+    );
+    let mut command = Command::new("osascript");
+    command.arg("-e").arg(script);
+    command
+}
+
+#[cfg(not(target_os = "macos"))]
 fn desktop_notification_command(urgency: &str, title: &str, body: Option<&str>) -> Command {
     let mut command = Command::new("notify-send");
     command

@@ -177,10 +177,11 @@ pub enum Action {
         /// Additionally raise a DESKTOP notification, at this urgency:
         /// "low", "normal" or "critical".
         ///
-        /// Linux only: it shells out to libnotify's `notify-send`, which macOS
-        /// has no equivalent of. Elsewhere the rule still fires and the herdr
-        /// toast still shows; only this extra notification is skipped, with a
-        /// line in the log.
+        /// Linux shells out to libnotify's `notify-send`; macOS runs
+        /// `osascript` for Notification Center, which has no urgency, so
+        /// "critical" cannot ask it to persist there. If the program cannot
+        /// run, the rule still fires and the herdr toast still shows; only this
+        /// extra notification is skipped, with a line in the log.
         ///
         /// This exists because herdr's own toast cannot be made to persist: an
         /// API notification is always its shortest kind, a fixed 3 seconds, and
