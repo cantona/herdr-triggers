@@ -7,6 +7,7 @@
 mod actions;
 mod client;
 mod config;
+mod core;
 mod engine;
 mod log;
 mod rules;
@@ -19,37 +20,101 @@ use client::Client;
 
 const PLUGIN_ID: &str = "cantona.herdr-triggers";
 const USAGE: &str = "\
-usage: herdr-triggersd <command> [--session <name> | --socket <path> | --all]
+usage: herdr-triggersd [--host herdr|core] <command> [--session <name> | --socket <path> | --all]
 
-A daemon runs per herdr server. With no target, the command acts on the server
-the calling shell belongs to - which is whichever pane you happen to be in, so
-be explicit when it matters:
+A daemon runs per server. --host picks the kind of server (default herdr):
+  herdr   a herdr TUI server, as the plugin uses it
+  core    herdr-core, the Herdr desktop app's terminals
+
+With no target, the command acts on the server the calling shell belongs to -
+which is whichever pane you happen to be in, so be explicit when it matters:
 
   --session <name>   the named session ('default' = the default server; a
-                     session actually named 'default' needs --socket)
+                     herdr session actually named 'default' needs --socket)
   --socket <path>    a server's socket directly
-  --all              every server found on this machine
+  --all              every server of that host found on this machine
 
-  start    detach and run the trigger daemon (idempotent)
-  restart  stop a running daemon, then start a fresh one
-  run      run the daemon in the foreground
-  stop     stop a running daemon
-  status   report daemon state, rule count and recent log lines
-  reload   re-read triggers.toml
-  reset    re-arm every `once` rule
+  start          detach and run the trigger daemon (idempotent)
+  restart        stop a running daemon, then start a fresh one
+  run            run the daemon in the foreground
+  stop           stop a running daemon
+  status [--json] report daemon state, rule count and recent log lines
+  reload         re-read triggers.toml
+  reset          re-arm every `once` rule
 ";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Host {
+    Herdr,
+    Core,
+}
+
+impl Host {
+    fn name(self) -> &'static str {
+        match self {
+            Host::Herdr => "herdr",
+            Host::Core => "core",
+        }
+    }
+}
+
+static HOST: std::sync::OnceLock<Host> = std::sync::OnceLock::new();
+
+fn host() -> Host {
+    HOST.get().copied().unwrap_or(Host::Herdr)
+}
+
+/// `--host herdr|core` or `--host=core` ahead of the command. Default herdr,
+/// so every existing plugin invocation keeps meaning what it meant.
+fn take_host(args: &mut Vec<String>) -> Result<Host, String> {
+    let (name, consumed) = match args.first().map(String::as_str) {
+        Some("--host") => (
+            args.get(1)
+                .cloned()
+                .ok_or_else(|| "--host needs a name: herdr or core".to_string())?,
+            2,
+        ),
+        Some(flag) if flag.starts_with("--host=") => (flag["--host=".len()..].to_string(), 1),
+        _ => return Ok(Host::Herdr),
+    };
+    args.drain(..consumed);
+    match name.as_str() {
+        "herdr" => Ok(Host::Herdr),
+        "core" => Ok(Host::Core),
+        other => Err(format!("unknown host {other:?}: use herdr or core")),
+    }
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let host = match take_host(&mut args) {
+        Ok(host) => host,
+        Err(message) => {
+            eprintln!("{message}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let _ = HOST.set(host);
     let command = args.first().cloned().unwrap_or_default();
+    // `status --json` is the one command with a flag of its own; it comes
+    // before the target so the target grammar stays one flag.
+    let json = command == "status" && args.get(1).is_some_and(|flag| flag == "--json");
+    let target_from = if json { 2 } else { 1 };
 
     // Resolve the target before anything reads the socket or state paths.
-    // `get(1..)` not `[1..]`: a bare invocation has no element 1 and slicing
-    // panicked, replacing the usage message with a stack trace.
-    match parse_target(args.get(1..).unwrap_or(&[])) {
+    match parse_target(args.get(target_from..).unwrap_or(&[])) {
         Ok(Target::Inherit) => {}
-        Ok(Target::One(path)) => client::set_socket_override(path),
-        Ok(Target::All) => std::process::exit(run_for_every_server(&command)),
+        Ok(Target::Socket(path)) => match host {
+            Host::Herdr => client::set_socket_override(path),
+            Host::Core => core::paths::set_socket_override(path),
+        },
+        Ok(Target::Session(name)) => {
+            if let Err(message) = select_session(host, &name) {
+                eprintln!("{message}\n\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+        Ok(Target::All) => std::process::exit(run_for_every_server(host, &command, json)),
         Err(message) => {
             eprintln!("{message}\n\n{USAGE}");
             std::process::exit(2);
@@ -62,6 +127,7 @@ fn main() {
         "stop" => signal_daemon(libc::SIGTERM, "stop"),
         "reload" => signal_daemon(libc::SIGHUP, "reload"),
         "reset" => signal_daemon(libc::SIGUSR1, "reset"),
+        "status" if json => status_json(),
         "status" => status(),
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
@@ -77,24 +143,22 @@ fn main() {
 
 enum Target {
     Inherit,
-    One(PathBuf),
+    Socket(PathBuf),
+    Session(String),
     All,
 }
 
 /// Reads the single optional target flag. One flag is the whole grammar, so
-/// this is a match rather than a loop.
+/// this is a match rather than a loop. Session names are resolved per host
+/// afterwards, because the two hosts keep their sockets in different places.
 fn parse_target(rest: &[String]) -> Result<Target, String> {
     let Some(flag) = rest.first() else {
         return Ok(Target::Inherit);
     };
     let value = rest.get(1);
-    // Reject an unknown flag before counting arguments, or the arity check
-    // reports the wrong thing for a typo like `--sesion com`.
     if !matches!(flag.as_str(), "--all" | "--socket" | "--session") {
         return Err(format!("unknown option {flag:?}"));
     }
-    // One target, or none. Silently honouring the first of two would act on a
-    // server the reader did not name.
     let consumed = if flag == "--all" { 1 } else { 2 };
     if rest.len() > consumed {
         return Err(format!("unexpected argument {:?}", rest[consumed]));
@@ -102,10 +166,21 @@ fn parse_target(rest: &[String]) -> Result<Target, String> {
     match flag.as_str() {
         "--all" => Ok(Target::All),
         "--socket" => value
-            .map(|path| Target::One(PathBuf::from(path)))
+            .map(|path| Target::Socket(PathBuf::from(path)))
             .ok_or_else(|| "--socket needs a path".to_string()),
-        "--session" => {
-            let name = value.ok_or("--session needs a name")?;
+        "--session" => value
+            .map(|name| Target::Session(name.clone()))
+            .ok_or_else(|| "--session needs a name".to_string()),
+        _ => unreachable!("unknown flag {flag:?} passed the guard above"),
+    }
+}
+
+/// Points this process at one named session of the host, refusing a name
+/// that has no live socket: silently falling back to the default server
+/// would act on the wrong panes.
+fn select_session(host: Host, name: &str) -> Result<(), String> {
+    match host {
+        Host::Herdr => {
             let sock = if name == "default" {
                 herdr_config_dir().join("herdr.sock")
             } else {
@@ -114,33 +189,47 @@ fn parse_target(rest: &[String]) -> Result<Target, String> {
                     .join(name)
                     .join("herdr.sock")
             };
-            if sock.exists() {
-                Ok(Target::One(sock))
-            } else {
-                Err(format!(
+            if !sock.exists() {
+                return Err(format!(
                     "no herdr server for session {name:?} ({})",
                     sock.display()
-                ))
+                ));
+            }
+            client::set_socket_override(sock);
+        }
+        Host::Core => {
+            core::paths::set_session_override(name.to_string());
+            let sock = core::paths::socket_path()?;
+            if !sock.exists() {
+                return Err(format!(
+                    "no herdr-core for session {name:?} ({})",
+                    sock.display()
+                ));
             }
         }
-        // The guard above already rejected anything else, so this exists only
-        // to satisfy exhaustiveness on a &str match.
-        _ => unreachable!("unknown flag {flag:?} passed the guard above"),
     }
+    Ok(())
 }
 
 /// Runs the command once per server, in a child so each gets its own resolved
 /// socket and state dir. Returns the worst exit code.
-fn run_for_every_server(command: &str) -> i32 {
+fn run_for_every_server(host: Host, command: &str, json: bool) -> i32 {
     if command == "run" {
-        // `run` is a foreground daemon: the first child would never return and
-        // the rest would never start.
         eprintln!("run cannot be used with --all; it stays in the foreground");
         return 2;
     }
-    let servers = client::discover_servers();
+    let servers = match host {
+        Host::Herdr => client::discover_servers(),
+        Host::Core => match core::paths::discover_sessions() {
+            Ok(servers) => servers,
+            Err(message) => {
+                eprintln!("{message}");
+                return 1;
+            }
+        },
+    };
     if servers.is_empty() {
-        eprintln!("no herdr server found");
+        eprintln!("no {} server found", host.name());
         return 1;
     }
     let Ok(exe) = std::env::current_exe() else {
@@ -149,12 +238,17 @@ fn run_for_every_server(command: &str) -> i32 {
     };
     let mut worst = 0;
     for (name, socket) in servers {
-        println!("== {name} ==");
-        let status = std::process::Command::new(&exe)
-            .arg(command)
-            .arg("--socket")
-            .arg(&socket)
-            .status();
+        // With --json each server's object is one line of output (JSON
+        // Lines); a header would make it unparsable.
+        if !json {
+            println!("== {name} ==");
+        }
+        let mut child = std::process::Command::new(&exe);
+        child.arg("--host").arg(host.name()).arg(command);
+        if json {
+            child.arg("--json");
+        }
+        let status = child.arg("--socket").arg(&socket).status();
         match status {
             Ok(status) => worst = worst.max(status.code().unwrap_or(1)),
             Err(err) => {
@@ -167,27 +261,49 @@ fn run_for_every_server(command: &str) -> i32 {
 }
 
 fn config_dir() -> PathBuf {
-    env_dir("HERDR_PLUGIN_CONFIG_DIR").unwrap_or_else(|| {
-        herdr_config_dir()
-            .join("plugins")
-            .join("config")
-            .join(PLUGIN_ID)
-    })
+    match host() {
+        Host::Herdr => env_dir("HERDR_PLUGIN_CONFIG_DIR").unwrap_or_else(|| {
+            herdr_config_dir()
+                .join("plugins")
+                .join("config")
+                .join(PLUGIN_ID)
+        }),
+        Host::Core => core::paths::config_dir(),
+    }
 }
 
-/// State lives per herdr SERVER, not per plugin.
-///
-/// A machine can run several herdr servers at once (a named session plus the
-/// default one), each with its own panes, and one daemon can only attach to one
-/// socket. Sharing a state dir would mean their pidfiles, locks and ledgers
-/// collide, and the flock would let only the first daemon run - so the session
-/// identity is part of the path.
+/// State lives per SERVER, not per plugin (see `session_tag`).
 fn state_dir() -> PathBuf {
-    let base = env_dir("HERDR_PLUGIN_STATE_DIR")
-        .unwrap_or_else(|| herdr_state_dir().join("plugins").join(PLUGIN_ID));
-    match session_tag() {
-        Some(tag) => base.join(tag),
-        None => base,
+    match host() {
+        Host::Herdr => {
+            let base = env_dir("HERDR_PLUGIN_STATE_DIR")
+                .unwrap_or_else(|| herdr_state_dir().join("plugins").join(PLUGIN_ID));
+            match session_tag() {
+                Some(tag) => base.join(tag),
+                None => base,
+            }
+        }
+        Host::Core => core::paths::state_dir(),
+    }
+}
+
+/// The server this process resolved to, as `status` reports it.
+fn session_label() -> String {
+    match host() {
+        Host::Herdr => session_tag().unwrap_or_else(|| "default".to_string()),
+        Host::Core => core::paths::server_tag(),
+    }
+}
+
+/// The socket this process resolved to, as text; an unresolvable core
+/// socket is reported, not hidden.
+fn socket_label() -> String {
+    match host() {
+        Host::Herdr => client::socket_path().display().to_string(),
+        Host::Core => match core::paths::socket_path() {
+            Ok(path) => path.display().to_string(),
+            Err(message) => format!("unresolved: {message}"),
+        },
     }
 }
 
@@ -258,9 +374,25 @@ fn log_path() -> PathBuf {
 
 fn start() -> i32 {
     if let Some(pid) = running_pid() {
-        // herdr re-runs startup hooks; a second daemon would double every fire.
-        println!("herdr-triggersd already running (pid {pid})");
-        return 0;
+        // A daemon told to stop still holds the lock until it exits. A start
+        // right behind the stop (the app's sidebar block closing in one
+        // layout and opening in the next) must wait for it, not report it as
+        // running and leave nothing behind once it is gone.
+        if !is_stopping(pid) {
+            // herdr re-runs startup hooks; a second daemon would double every fire.
+            println!("herdr-triggersd already running (pid {pid})");
+            return 0;
+        }
+        if !wait_for_lock(std::time::Duration::from_secs(5)) {
+            // Another start may have won the lock meanwhile: a new daemon
+            // holds it, not the one that was stopping.
+            if let Some(now) = running_pid().filter(|now| *now != pid && !is_stopping(*now)) {
+                println!("herdr-triggersd already running (pid {now})");
+                return 0;
+            }
+            eprintln!("stopping daemon (pid {pid}) still holds the lock after 5s; not starting");
+            return 1;
+        }
     }
     // Detach before anything spawns a thread: fork() in a threaded process only
     // carries the calling thread into the child.
@@ -288,13 +420,9 @@ fn restart() -> i32 {
         if code != 0 {
             return code;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !lock_is_free() {
-            if std::time::Instant::now() >= deadline {
-                eprintln!("old daemon still holds the lock after 5s; not starting a new one");
-                return 1;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        if !wait_for_lock(std::time::Duration::from_secs(5)) {
+            eprintln!("old daemon still holds the lock after 5s; not starting a new one");
+            return 1;
         }
     } else {
         println!("nothing running; starting");
@@ -328,9 +456,16 @@ fn daemon_main() {
         return;
     }
     write_pidfile();
+    let _ = std::fs::remove_file(stopping_path());
     install_signal_handlers();
 
-    let server: std::sync::Arc<dyn server::Server> = std::sync::Arc::new(Client::from_env());
+    let server: std::sync::Arc<dyn server::Server> = match host() {
+        Host::Herdr => std::sync::Arc::new(Client::from_env()),
+        Host::Core => {
+            log_line!("the core host is not wired yet");
+            return;
+        }
+    };
     log_line!(
         "herdr-triggersd {} starting (socket {})",
         env!("CARGO_PKG_VERSION"),
@@ -486,11 +621,36 @@ fn lock_is_free() -> bool {
     free
 }
 
+fn stopping_path() -> PathBuf {
+    state_dir().join("triggersd.stopping")
+}
+
+/// Whether daemon `pid` has been sent a stop it has not finished acting on.
+fn is_stopping(pid: i32) -> bool {
+    std::fs::read_to_string(stopping_path()).is_ok_and(|text| text.trim().parse::<i32>() == Ok(pid))
+}
+
+/// Waits for the daemon lock to be released; false if it is still held.
+fn wait_for_lock(limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while !lock_is_free() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    true
+}
+
 fn signal_daemon(signal: libc::c_int, label: &str) -> i32 {
     let Some(pid) = running_pid() else {
         eprintln!("herdr-triggersd is not running");
         return 1;
     };
+    if signal == libc::SIGTERM {
+        // Lets a start that follows tell a dying daemon from a running one.
+        let _ = std::fs::write(stopping_path(), format!("{pid}\n"));
+    }
     if unsafe { libc::kill(pid, signal) } != 0 {
         eprintln!(
             "cannot {label} pid {pid}: {}",
@@ -506,7 +666,7 @@ fn status() -> i32 {
     // Which server this command resolved to: a daemon runs per herdr server,
     // and the answer depends on ambient env, so print it rather than let the
     // reader assume.
-    println!("herdr socket: {}", client::socket_path().display());
+    println!("{} socket: {}", host().name(), socket_label());
     println!("state dir:    {}", state_dir().display());
     match running_pid() {
         Some(pid) => println!("running (pid {pid})"),
@@ -534,14 +694,132 @@ fn status() -> i32 {
     0
 }
 
+/// One JSON object for the mod dialog: the same facts `status` prints, plus
+/// the last fire parsed out of the log so the dialog need not.
+fn status_json() -> i32 {
+    let triggers = config_dir().join("triggers.toml");
+    let (rules, config_error) = match config::load_triggers(&triggers) {
+        Ok(loaded) => (Some(loaded.rules.len()), None),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    let log = log_tail(&log_path(), 20).unwrap_or_default();
+    let pid = running_pid();
+    let out = serde_json::json!({
+        "host": host().name(),
+        "session": session_label(),
+        "socket": socket_label(),
+        "state_dir": state_dir().display().to_string(),
+        "running": pid.is_some(),
+        "pid": pid,
+        "config": triggers.display().to_string(),
+        "rules": rules,
+        "config_error": config_error,
+        "last_fire": last_fire(&log),
+        "log": log,
+    });
+    println!("{out}");
+    0
+}
+
+/// The last `lines` lines of the log, or `None` when it cannot be read.
+fn log_tail(path: &Path, lines: usize) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let all: Vec<&str> = text.lines().collect();
+    Some(
+        all.iter()
+            .skip(all.len().saturating_sub(lines))
+            .map(|line| line.to_string())
+            .collect(),
+    )
+}
+
+/// `[1794212049.221] rule ssh-auth started in t13: send_text` is what the
+/// engine logs on a fire; the newest such line, if any, as rule, pane and time.
+fn last_fire(lines: &[String]) -> Option<serde_json::Value> {
+    lines.iter().rev().find_map(|line| {
+        let (stamp, rest) = line.split_once("] ")?;
+        let (secs, millis) = stamp.strip_prefix('[')?.split_once('.')?;
+        let at_ms = secs
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(1000)?
+            .checked_add(millis.parse::<u64>().ok()?)?;
+        let rest = rest.strip_prefix("rule ")?;
+        let (rule, rest) = rest.split_once(" started in ")?;
+        // herdr pane ids contain a colon (`w1:p2`); the summary follows ": ".
+        let (pane, _) = rest.split_once(": ")?;
+        Some(serde_json::json!({"rule": rule, "pane": pane, "at_ms": at_ms}))
+    })
+}
+
 fn print_log_tail(path: &Path, lines: usize) {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(tail) = log_tail(path, lines) else {
         println!("no log at {}", path.display());
         return;
     };
     println!("--- {} (last {lines} lines) ---", path.display());
-    let all: Vec<&str> = text.lines().collect();
-    for line in all.iter().skip(all.len().saturating_sub(lines)) {
+    for line in tail {
         println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_host_flag_is_optional_and_comes_first() {
+        let mut plain = args(&["status"]);
+        assert_eq!(take_host(&mut plain).unwrap(), Host::Herdr);
+        assert_eq!(plain, args(&["status"]));
+
+        let mut spaced = args(&["--host", "core", "start"]);
+        assert_eq!(take_host(&mut spaced).unwrap(), Host::Core);
+        assert_eq!(spaced, args(&["start"]));
+
+        let mut joined = args(&["--host=herdr", "stop", "--all"]);
+        assert_eq!(take_host(&mut joined).unwrap(), Host::Herdr);
+        assert_eq!(joined, args(&["stop", "--all"]));
+
+        assert!(take_host(&mut args(&["--host", "tui"])).is_err());
+        assert!(take_host(&mut args(&["--host"])).is_err());
+    }
+
+    #[test]
+    fn the_target_grammar_is_one_flag() {
+        assert!(matches!(parse_target(&[]).unwrap(), Target::Inherit));
+        assert!(matches!(
+            parse_target(&args(&["--all"])).unwrap(),
+            Target::All
+        ));
+        assert!(
+            matches!(parse_target(&args(&["--session", "com"])).unwrap(), Target::Session(name) if name == "com")
+        );
+        assert!(
+            matches!(parse_target(&args(&["--socket", "/s"])).unwrap(), Target::Socket(path) if path == Path::new("/s"))
+        );
+        assert!(parse_target(&args(&["--sesion", "com"])).is_err());
+        assert!(parse_target(&args(&["--all", "extra"])).is_err());
+        assert!(parse_target(&args(&["--session"])).is_err());
+    }
+
+    #[test]
+    fn the_last_fire_is_parsed_from_the_newest_started_line() {
+        let lines = vec![
+            "[1794212049.221] rule ssh-auth started in t13: send_text".to_string(),
+            "[1794212050.000] rule ssh-auth not fired in t13: cooldown".to_string(),
+            "[1794212051.500] rule login started in w1:p2: coprocess answer.sh".to_string(),
+            "[1794212052.000] watching 2 rule/pane pairs across 2 panes every 200ms".to_string(),
+        ];
+        let fire = last_fire(&lines).unwrap();
+        assert_eq!(fire["rule"], "login");
+        assert_eq!(fire["pane"], "w1:p2");
+        assert_eq!(fire["at_ms"], 1794212051500u64);
+        assert!(last_fire(&[]).is_none());
+        assert!(last_fire(&["garbage".to_string()]).is_none());
     }
 }
