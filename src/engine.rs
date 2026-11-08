@@ -130,7 +130,7 @@ impl Engine {
                 Err(err) => log_line!("rule {index} skipped, bad regex: {err}"),
             }
         }
-        for warning in config::warnings(&rules) {
+        for warning in config::warnings(&rules, self.server.notify_is_desktop()) {
             log_line!("warning: {warning}");
         }
         log_line!(
@@ -165,7 +165,14 @@ impl Engine {
             self.drain_control_flags();
 
             if self.rules.is_empty() {
-                sleep_interruptibly(self.poll_interval());
+                // A failure that is not fatal still sleeps: retrying at once
+                // would spin until the patience window runs out.
+                if let Err(err) = self.server.alive().and(self.pause()) {
+                    if self.server.is_fatal(&err) {
+                        log_line!("server is gone ({err}); exiting");
+                        return;
+                    }
+                }
                 continue;
             }
 
@@ -184,9 +191,37 @@ impl Engine {
                 }
             }
 
-            sleep_interruptibly(self.poll_interval());
+            if let Err(err) = self.pause() {
+                if self.server.is_fatal(&err) {
+                    log_line!("server is gone ({err}); exiting");
+                    return;
+                }
+            }
         }
         log_line!("stopping");
+    }
+
+    /// One poll interval of sleep, asking the server between slices of at
+    /// most `KEEPALIVE` whether it is still there: a long `poll_ms` must not
+    /// keep a daemon whose server, or app, has gone. The herdr host has
+    /// nothing to check and answers at once.
+    fn pause(&self) -> Result<(), ServerError> {
+        let mut left = self.poll_interval();
+        while !left.is_zero() && !STOP.load(Ordering::Relaxed) {
+            let step = left.min(KEEPALIVE);
+            sleep_interruptibly(step);
+            left -= step;
+            // Only a fatal answer cuts the sleep short; any other failure is
+            // the next poll's to handle.
+            if !left.is_zero() {
+                if let Err(err) = self.server.alive() {
+                    if self.server.is_fatal(&err) {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One pass: list the panes, read every watched one, evaluate its rules.
@@ -232,7 +267,13 @@ impl Engine {
             watched += applicable.len();
             // One read per pane per poll, and one pass over its lines, both
             // shared by every rule on that pane.
-            let Some(text) = self.read_pane(&pane.pane_id) else {
+            // A stop request is honoured between panes and between rules,
+            // not after the whole pass: a slow server or a slow helper must
+            // not hold the daemon past `restart`'s wait.
+            if STOP.load(Ordering::Relaxed) {
+                break;
+            }
+            let Some(text) = self.read_pane(&pane.pane_id)? else {
                 continue;
             };
             let screen = Screen::new(&text);
@@ -240,6 +281,9 @@ impl Engine {
             // nothing matches at the tail, and every rule on it must drop its
             // latch - otherwise `clear` could never re-arm a rule.
             for index in applicable {
+                if STOP.load(Ordering::Relaxed) {
+                    break;
+                }
                 self.evaluate(index, pane, &text, &screen);
             }
         }
@@ -288,15 +332,19 @@ impl Engine {
         })
     }
 
-    fn read_pane(&self, pane_id: &str) -> Option<String> {
+    /// The pane's text, `None` when this one pane cannot be read, and an error
+    /// when the server itself failed: the rest of the poll would only repeat
+    /// the failure, one timeout per pane.
+    fn read_pane(&self, pane_id: &str) -> Result<Option<String>, ServerError> {
         match self
             .server
             .read(pane_id, &self.settings.source, self.settings.lines)
         {
             Ok(text) => {
                 self.read_failures.borrow_mut().remove(pane_id);
-                Some(text)
+                Ok(Some(text))
             }
+            Err(err) if self.server.aborts_poll(&err) => Err(err),
             Err(err) => {
                 // A failure, not noise: a pane that cannot be read never has
                 // its rules evaluated at all, so this is recorded at `fires`
@@ -305,7 +353,7 @@ impl Engine {
                 if self.read_failures.borrow_mut().insert(pane_id.to_string()) {
                     log_line!("cannot read {pane_id}: {err}");
                 }
-                None
+                Ok(None)
             }
         }
     }
@@ -521,6 +569,8 @@ fn armed_key(rule_id: &str, pane_id: &str) -> String {
 }
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+/// The longest a sleep goes without asking the server whether it is there.
+const KEEPALIVE: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 fn next_backoff(current: Duration) -> Duration {
@@ -767,7 +817,7 @@ mod tests {
                 let pane = pane("w1:p1");
                 let key = armed_key(&engine.rules[0].id, &pane.pane_id);
                 for iteration in 0..4 {
-                    if let Some(text) = engine.read_pane(&pane.pane_id) {
+                    if let Some(text) = engine.read_pane(&pane.pane_id).unwrap() {
                         engine.evaluate(0, &pane, &text, &Screen::new(&text));
                     }
                     assert_eq!(engine.latched.contains_key(&key), iteration != 3);
@@ -919,6 +969,185 @@ mod tests {
             .insert("p1".into(), "ok\nPassword:".into());
         engine.poll().unwrap();
         assert_eq!(fake.typed.lock().unwrap().len(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Every read fails as if the server went away.
+    struct DeadServer {
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Server for DeadServer {
+        fn describe(&self) -> String {
+            "dead".into()
+        }
+        fn panes(&self, _with_labels: bool) -> Result<Vec<PaneInfo>, ServerError> {
+            Ok(vec![pane("p1"), pane("p2"), pane("p3")])
+        }
+        fn read(
+            &self,
+            _pane_id: &str,
+            _source: &str,
+            _lines: Option<u32>,
+        ) -> Result<String, ServerError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Err(ServerError::Gone("test".into()))
+        }
+        fn send_text(&self, _pane_id: &str, _text: &str) -> Result<(), ServerError> {
+            Ok(())
+        }
+        fn tab_label(&self, _tab_id: &str) -> Result<String, ServerError> {
+            Ok(String::new())
+        }
+        fn rename_tab(&self, _tab_id: &str, _label: &str) -> Result<(), ServerError> {
+            Ok(())
+        }
+        fn notify(&self, _n: &crate::server::Notification<'_>) -> Result<String, ServerError> {
+            Ok("shown".into())
+        }
+    }
+
+    #[test]
+    fn a_server_wide_read_failure_ends_the_poll_at_the_first_pane() {
+        let dead = Arc::new(DeadServer {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let root = std::env::temp_dir().join(format!("triggers-dead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut engine = Engine::new(dead.clone(), &root, &root);
+        engine.rules = vec![rule(None)];
+        assert!(matches!(engine.poll(), Err(ServerError::Gone(_))));
+        assert_eq!(dead.reads.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Up, but every `alive()` fails without being fatal (a reconnect that
+    /// is refused inside the patience window).
+    struct Flaky {
+        alive: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Server for Flaky {
+        fn describe(&self) -> String {
+            "flaky".into()
+        }
+        fn alive(&self) -> Result<(), ServerError> {
+            self.alive.fetch_add(1, Ordering::Relaxed);
+            Err(ServerError::Client(crate::client::ClientError::Closed))
+        }
+        fn panes(&self, _with_labels: bool) -> Result<Vec<PaneInfo>, ServerError> {
+            Ok(Vec::new())
+        }
+        fn read(&self, _p: &str, _s: &str, _l: Option<u32>) -> Result<String, ServerError> {
+            Ok(String::new())
+        }
+        fn send_text(&self, _p: &str, _t: &str) -> Result<(), ServerError> {
+            Ok(())
+        }
+        fn tab_label(&self, _t: &str) -> Result<String, ServerError> {
+            Ok(String::new())
+        }
+        fn rename_tab(&self, _t: &str, _l: &str) -> Result<(), ServerError> {
+            Ok(())
+        }
+        fn notify(&self, _n: &crate::server::Notification<'_>) -> Result<String, ServerError> {
+            Ok("shown".into())
+        }
+    }
+
+    #[test]
+    fn a_failure_that_is_not_fatal_does_not_cut_the_sleep_short() {
+        let flaky = Arc::new(Flaky {
+            alive: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let root = std::env::temp_dir().join(format!("triggers-flaky-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut engine = Engine::new(flaky.clone(), &root, &root);
+        // Longer than one keepalive slice, so alive() is asked in between.
+        engine.settings.poll_ms = 5_200;
+        let started = std::time::Instant::now();
+        assert!(engine.pause().is_ok());
+        assert!(
+            started.elapsed() >= Duration::from_millis(5_200),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(flaky.alive.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A host whose only notification channel is a helper program.
+    struct Notifier {
+        works: std::sync::atomic::AtomicBool,
+        shown: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Server for Notifier {
+        fn describe(&self) -> String {
+            "notifier".into()
+        }
+        fn panes(&self, _with_labels: bool) -> Result<Vec<PaneInfo>, ServerError> {
+            Ok(vec![pane("p1")])
+        }
+        fn read(&self, _p: &str, _s: &str, _l: Option<u32>) -> Result<String, ServerError> {
+            Ok("build\nPassword:".into())
+        }
+        fn send_text(&self, _p: &str, _t: &str) -> Result<(), ServerError> {
+            Ok(())
+        }
+        fn tab_label(&self, _t: &str) -> Result<String, ServerError> {
+            Ok(String::new())
+        }
+        fn rename_tab(&self, _t: &str, _l: &str) -> Result<(), ServerError> {
+            Ok(())
+        }
+        fn notify(&self, _n: &crate::server::Notification<'_>) -> Result<String, ServerError> {
+            if !self.works.load(Ordering::Relaxed) {
+                return Err(ServerError::Helper("cannot run notify-send".into()));
+            }
+            self.shown.fetch_add(1, Ordering::Relaxed);
+            Ok("shown".into())
+        }
+    }
+
+    #[test]
+    fn a_notifier_that_cannot_deliver_leaves_a_once_rule_armed() {
+        let notifier = Arc::new(Notifier {
+            works: std::sync::atomic::AtomicBool::new(false),
+            shown: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let root = std::env::temp_dir().join(format!("triggers-notifier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut engine = Engine::new(notifier.clone(), &root, &root);
+        engine.rules = vec![CompiledRule::compile(&config::Rule {
+            regex: "Password:".into(),
+            once: true,
+            scope: None,
+            tail_within: Some(1),
+            action: config::Action::Notify {
+                title: "asked".into(),
+                body: None,
+                sound: None,
+                position: None,
+                desktop: None,
+            },
+        })
+        .unwrap()];
+        engine.settings.fire_on_existing_text = true;
+        engine.guard = FireGuard::new(0, 1000);
+
+        engine.poll().unwrap();
+        assert_eq!(notifier.shown.load(Ordering::Relaxed), 0);
+        // The notifier is installed; skip the backoff instead of waiting it out.
+        notifier.works.store(true, Ordering::Relaxed);
+        engine.retry_after.clear();
+        engine.poll().unwrap();
+        engine.retry_after.clear();
+        engine.poll().unwrap();
+        assert_eq!(notifier.shown.load(Ordering::Relaxed), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

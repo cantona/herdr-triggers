@@ -20,11 +20,13 @@ use client::Client;
 
 const PLUGIN_ID: &str = "cantona.herdr-triggers";
 const USAGE: &str = "\
-usage: herdr-triggersd [--host herdr|core] <command> [--session <name> | --socket <path> | --all]
+usage: herdr-triggersd [--host herdr|core] [--follow-app] <command> [--session <name> | --socket <path> | --all]
 
 A daemon runs per server. --host picks the kind of server (default herdr):
   herdr   a herdr TUI server, as the plugin uses it
   core    herdr-core, the Herdr desktop app's terminals
+--follow-app: a core daemon this starts exits once the Herdr app has been
+closed for 10 s (the app's mod passes it).
 
 With no target, the command acts on the server the calling shell belongs to -
 which is whichever pane you happen to be in, so be explicit when it matters:
@@ -59,6 +61,8 @@ impl Host {
 }
 
 static HOST: std::sync::OnceLock<Host> = std::sync::OnceLock::new();
+/// `--follow-app`: a core daemon started by the app's mod leaves with it.
+static FOLLOW_APP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn host() -> Host {
     HOST.get().copied().unwrap_or(Host::Herdr)
@@ -95,6 +99,16 @@ fn main() {
         }
     };
     let _ = HOST.set(host);
+    if args.first().is_some_and(|arg| arg == "--follow-app") {
+        // Only a core daemon watches the app; on herdr the flag would be
+        // recorded and reported without anything behind it.
+        if host != Host::Core {
+            eprintln!("--follow-app needs --host core\n\n{USAGE}");
+            std::process::exit(2);
+        }
+        args.remove(0);
+        FOLLOW_APP.store(true, Ordering::Relaxed);
+    }
     let command = args.first().cloned().unwrap_or_default();
     // `status --json` is the one command with a flag of its own; it comes
     // before the target so the target grammar stays one flag.
@@ -124,7 +138,7 @@ fn main() {
         "start" => start(),
         "restart" => restart(),
         "run" => run_foreground(),
-        "stop" => signal_daemon(libc::SIGTERM, "stop"),
+        "stop" => stop(),
         "reload" => signal_daemon(libc::SIGHUP, "reload"),
         "reset" => signal_daemon(libc::SIGUSR1, "reset"),
         "status" if json => status_json(),
@@ -244,7 +258,11 @@ fn run_for_every_server(host: Host, command: &str, json: bool) -> i32 {
             println!("== {name} ==");
         }
         let mut child = std::process::Command::new(&exe);
-        child.arg("--host").arg(host.name()).arg(command);
+        child.arg("--host").arg(host.name());
+        if FOLLOW_APP.load(Ordering::Relaxed) {
+            child.arg("--follow-app");
+        }
+        child.arg(command);
         if json {
             child.arg("--json");
         }
@@ -380,18 +398,23 @@ fn start() -> i32 {
         // running and leave nothing behind once it is gone.
         if !is_stopping(pid) {
             // herdr re-runs startup hooks; a second daemon would double every fire.
-            println!("herdr-triggersd already running (pid {pid})");
+            already_running(pid);
             return 0;
         }
-        if !wait_for_lock(std::time::Duration::from_secs(5)) {
-            // Another start may have won the lock meanwhile: a new daemon
-            // holds it, not the one that was stopping.
-            if let Some(now) = running_pid().filter(|now| *now != pid && !is_stopping(*now)) {
-                println!("herdr-triggersd already running (pid {now})");
+        match wait_for_exit(pid) {
+            Exit::Gone => {}
+            // Another start won the lock meanwhile.
+            Exit::Replaced(now) => {
+                already_running(now);
                 return 0;
             }
-            eprintln!("stopping daemon (pid {pid}) still holds the lock after 5s; not starting");
-            return 1;
+            Exit::Stuck => {
+                eprintln!(
+                    "stopping daemon (pid {pid}) still holds the lock after {}s; not starting",
+                    STOP_WAIT.as_secs()
+                );
+                return 1;
+            }
         }
     }
     // Detach before anything spawns a thread: fork() in a threaded process only
@@ -409,20 +432,97 @@ fn start() -> i32 {
     }
 }
 
+/// Reports a running daemon, and when the caller wanted one that follows the
+/// app, that this one does not.
+fn already_running(pid: i32) {
+    println!("herdr-triggersd already running (pid {pid})");
+    if FOLLOW_APP.load(Ordering::Relaxed) && !follows_app() {
+        println!("it was started without --follow-app and will outlive the app; restart it with --follow-app to change that");
+    }
+}
+
+/// Stops the daemon and returns once it has exited, so a status read right
+/// after says "stopped".
+fn stop() -> i32 {
+    let Some(pid) = running_pid() else {
+        eprintln!("herdr-triggersd is not running");
+        return 1;
+    };
+    let code = signal_daemon(libc::SIGTERM, "stop");
+    if code != 0 {
+        return code;
+    }
+    match wait_for_exit(pid) {
+        Exit::Gone => 0,
+        Exit::Replaced(now) => {
+            eprintln!(
+                "herdr-triggersd (pid {pid}) stopped, but a start launched pid {now} meanwhile"
+            );
+            1
+        }
+        Exit::Stuck => {
+            eprintln!(
+                "herdr-triggersd (pid {pid}) is still stopping after {}s",
+                STOP_WAIT.as_secs()
+            );
+            1
+        }
+    }
+}
+
+enum Exit {
+    Gone,
+    /// Another daemon holds the lock now.
+    Replaced(i32),
+    Stuck,
+}
+
+/// Waits for daemon `pid` to let go of the lock, and notices a racing
+/// `start` that took it the moment it was free rather than run out the whole
+/// limit. Gone means the lock is free: the daemon removes its pid file
+/// before it exits, and a new one takes the lock before writing its own, so
+/// a held lock without another pid is still waited on.
+fn wait_for_exit(pid: i32) -> Exit {
+    let deadline = std::time::Instant::now() + STOP_WAIT;
+    loop {
+        if lock_is_free() {
+            return Exit::Gone;
+        }
+        if let Some(now) = recorded_pid().filter(|now| *now != pid) {
+            return Exit::Replaced(now);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Exit::Stuck;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Stops a running daemon and starts a fresh one.
 ///
 /// Waits for the old daemon to actually release its lock rather than sleeping a
 /// guessed interval: `start` refuses while the lock is held, so returning too
 /// early would leave nothing running at all.
 fn restart() -> i32 {
-    if running_pid().is_some() {
+    if let Some(pid) = running_pid() {
         let code = signal_daemon(libc::SIGTERM, "stop");
         if code != 0 {
             return code;
         }
-        if !wait_for_lock(std::time::Duration::from_secs(5)) {
-            eprintln!("old daemon still holds the lock after 5s; not starting a new one");
-            return 1;
+        match wait_for_exit(pid) {
+            Exit::Gone => {}
+            // A racing start already put a fresh daemon there.
+            Exit::Replaced(now) => {
+                already_running(now);
+                return 0;
+            }
+            Exit::Stuck => {
+                eprintln!(
+                    "old daemon still holds the lock after {}s; not starting a new one",
+                    STOP_WAIT.as_secs()
+                );
+                return 1;
+            }
         }
     } else {
         println!("nothing running; starting");
@@ -457,14 +557,34 @@ fn daemon_main() {
     }
     write_pidfile();
     let _ = std::fs::remove_file(stopping_path());
+    // Whether this daemon leaves with the app, for `status` and for a start
+    // from the app that finds it already running.
+    let _ = std::fs::write(
+        mode_path(),
+        if FOLLOW_APP.load(Ordering::Relaxed) {
+            "follow-app\n"
+        } else {
+            "standalone\n"
+        },
+    );
     install_signal_handlers();
 
     let server: std::sync::Arc<dyn server::Server> = match host() {
         Host::Herdr => std::sync::Arc::new(Client::from_env()),
-        Host::Core => {
-            log_line!("the core host is not wired yet");
-            return;
-        }
+        Host::Core => match core::paths::socket_path() {
+            Ok(socket) => {
+                let server = core::CoreServer::new(socket);
+                if FOLLOW_APP.load(Ordering::Relaxed) {
+                    std::sync::Arc::new(server.following_app(core::paths::app_socket()))
+                } else {
+                    std::sync::Arc::new(server)
+                }
+            }
+            Err(message) => {
+                log_line!("cannot resolve the herdr-core socket: {message}");
+                return;
+            }
+        },
     };
     log_line!(
         "herdr-triggersd {} starting (socket {})",
@@ -596,6 +716,11 @@ fn running_pid() -> Option<i32> {
     if lock_is_free() {
         return None;
     }
+    recorded_pid()
+}
+
+/// The pid the daemon wrote, whether or not it still holds the lock.
+fn recorded_pid() -> Option<i32> {
     let text = std::fs::read_to_string(pid_path()).ok()?;
     text.trim().parse().ok()
 }
@@ -621,25 +746,30 @@ fn lock_is_free() -> bool {
     free
 }
 
+fn mode_path() -> PathBuf {
+    state_dir().join("triggersd.mode")
+}
+
+/// Whether the running daemon was started with `--follow-app`.
+fn follows_app() -> bool {
+    std::fs::read_to_string(mode_path()).is_ok_and(|mode| mode.trim() == "follow-app")
+}
+
 fn stopping_path() -> PathBuf {
     state_dir().join("triggersd.stopping")
 }
 
+/// How long `stop`, `start` and `restart` wait for a stopping daemon to
+/// exit. A stop lands between rules, so it can sit behind one pane read and
+/// one action: on herdr-core a reconnect and read of up to 8s (connect,
+/// hello, subscribe and read, 2s each) plus a helper allowed 5s, and before
+/// the read a coprocess's typing may hold the connection for up to 8s more
+/// (a reconnect, then the attach).
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Whether daemon `pid` has been sent a stop it has not finished acting on.
 fn is_stopping(pid: i32) -> bool {
     std::fs::read_to_string(stopping_path()).is_ok_and(|text| text.trim().parse::<i32>() == Ok(pid))
-}
-
-/// Waits for the daemon lock to be released; false if it is still held.
-fn wait_for_lock(limit: std::time::Duration) -> bool {
-    let deadline = std::time::Instant::now() + limit;
-    while !lock_is_free() {
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    true
 }
 
 fn signal_daemon(signal: libc::c_int, label: &str) -> i32 {
@@ -710,6 +840,7 @@ fn status_json() -> i32 {
         "socket": socket_label(),
         "state_dir": state_dir().display().to_string(),
         "running": pid.is_some(),
+        "follows_app": pid.is_some() && follows_app(),
         "pid": pid,
         "config": triggers.display().to_string(),
         "rules": rules,

@@ -228,7 +228,9 @@ pub enum Action {
 
 /// Configuration that is valid but likely to do damage, reported at load time
 /// rather than discovered by a password landing in the wrong pane.
-pub fn warnings(rules: &[Rule]) -> Vec<String> {
+/// `every_notify_is_desktop`: the host turns every `notify` into a desktop
+/// notification, not only those with `desktop` set.
+pub fn warnings(rules: &[Rule], every_notify_is_desktop: bool) -> Vec<String> {
     let mut warnings = Vec::new();
     for (index, rule) in rules.iter().enumerate() {
         let unscoped = rule.scope.is_none();
@@ -240,12 +242,15 @@ pub fn warnings(rules: &[Rule]) -> Vec<String> {
             ));
         }
         if let Action::Notify {
-            desktop: Some(_),
+            desktop,
             title,
             body,
             ..
         } = &rule.action
         {
+            if desktop.is_none() && !every_notify_is_desktop {
+                continue;
+            }
             let expands_screen_text = |text: &str| {
                 text.contains("${match}") || (1..=9).any(|n| text.contains(&format!("${n}")))
             };
@@ -540,12 +545,31 @@ action = { type = "send_text", text = "${secret:PASS}\n" }
             0o644,
         );
         let config = load_triggers(&path).expect("config parses");
-        let warnings = warnings(&config.rules);
+        let warnings = warnings(&config.rules, false);
         assert_eq!(warnings.len(), 2, "got {warnings:?}");
         assert!(warnings
             .iter()
             .all(|warning| warning.starts_with("rule 0 ")));
         assert!(warnings[1].contains("sends a secret"));
+    }
+
+    #[test]
+    fn a_plain_notify_with_screen_text_is_reported_only_where_it_becomes_argv() {
+        let path = temp_file(
+            "triggers.toml",
+            r#"
+[[rules]]
+regex = "boom"
+scope = { pane_title = "x" }
+action = { type = "notify", title = "hit", body = "${match}" }
+"#,
+            0o644,
+        );
+        let config = load_triggers(&path).expect("config parses");
+        assert!(warnings(&config.rules, false).is_empty());
+        let core = warnings(&config.rules, true);
+        assert_eq!(core.len(), 1, "got {core:?}");
+        assert!(core[0].contains("desktop notification"));
     }
 
     #[test]
@@ -560,7 +584,7 @@ action = { type = "tab_mark", marker = "! " }
             0o644,
         );
         let config = load_triggers(&path).expect("config parses");
-        assert!(warnings(&config.rules).is_empty());
+        assert!(warnings(&config.rules, false).is_empty());
     }
 
     #[test]

@@ -51,8 +51,10 @@ pub enum ActionError {
 
 impl ActionError {
     /// True when the failure is the user's to fix - a secret that cannot be
-    /// resolved, or a program that is missing or not executable. Such a rule
-    /// stays armed so the fix takes effect without a reload.
+    /// resolved, or a program that is missing or not executable, including
+    /// a host's helper (the desktop notifier, `herdr-app`) that could not
+    /// deliver. Such a rule stays armed so the fix takes effect without a
+    /// reload.
     pub fn is_users_to_fix(&self) -> bool {
         matches!(
             self,
@@ -60,6 +62,7 @@ impl ActionError {
                 | ActionError::UnknownSecret(_)
                 | ActionError::SecretNotAllowed(_, _)
                 | ActionError::Spawn(_, _)
+                | ActionError::Server(ServerError::Helper(_))
         )
     }
 }

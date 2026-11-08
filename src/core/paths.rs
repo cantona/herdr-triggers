@@ -146,6 +146,19 @@ fn discover_in(inputs: &SocketInputs) -> Vec<(String, PathBuf)> {
     found
 }
 
+/// The Herdr desktop app's control socket: in `HERDR_APP_HOME`, else
+/// `herdr-app` under the config home. It stays on disk after the app quits;
+/// only a refused connection tells that it is gone.
+pub fn app_socket() -> PathBuf {
+    non_empty("HERDR_APP_HOME")
+        .unwrap_or_else(|| {
+            non_empty("XDG_CONFIG_HOME")
+                .unwrap_or_else(|| home_dir().join(".config"))
+                .join("herdr-app")
+        })
+        .join("herdr-app.sock")
+}
+
 /// `~/.config/herdr-triggers`, or `HERDR_TRIGGERS_CONFIG_DIR`.
 pub fn config_dir() -> PathBuf {
     non_empty("HERDR_TRIGGERS_CONFIG_DIR").unwrap_or_else(|| {

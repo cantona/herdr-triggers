@@ -47,12 +47,19 @@ pub struct Notification<'a> {
 #[derive(Debug)]
 pub enum ServerError {
     Client(ClientError),
+    /// The server is gone for good; the daemon should exit, not retry.
+    Gone(String),
+    /// A helper program the host relies on (herdr-app, notify-send,
+    /// osascript) could not be run or failed.
+    Helper(String),
 }
 
 impl fmt::Display for ServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ServerError::Client(err) => write!(f, "{err}"),
+            ServerError::Gone(why) => write!(f, "{why}"),
+            ServerError::Helper(why) => write!(f, "{why}"),
         }
     }
 }
@@ -82,10 +89,26 @@ pub trait Server: Send + Sync {
     /// Posts a notification and returns the host's reason word: `shown`,
     /// `disabled`, `busy`, or whatever else it reports.
     fn notify(&self, n: &Notification<'_>) -> Result<String, ServerError>;
-    /// Whether this failure means the daemon should exit instead of
-    /// retrying. The herdr host retries forever.
-    fn is_fatal(&self, _err: &ServerError) -> bool {
+    /// Checked while there are no rules, so a host whose server can go away
+    /// still notices it. Must cost nothing on a live server; the herdr host
+    /// has nothing to notice and does nothing.
+    fn alive(&self) -> Result<(), ServerError> {
+        Ok(())
+    }
+    /// Whether every `notify` becomes a desktop notification, whose title and
+    /// body are another program's argv, readable by any local user in /proc.
+    fn notify_is_desktop(&self) -> bool {
         false
+    }
+    /// Whether this failure is the server's rather than one pane's, so the
+    /// rest of the poll is skipped. The herdr host answers every pane alone.
+    fn aborts_poll(&self, err: &ServerError) -> bool {
+        self.is_fatal(err)
+    }
+    /// Whether this failure means the daemon should exit instead of
+    /// retrying. The herdr host never reports `Gone`, so it retries forever.
+    fn is_fatal(&self, err: &ServerError) -> bool {
+        matches!(err, ServerError::Gone(_))
     }
 }
 
@@ -121,7 +144,7 @@ pub fn raise_desktop_notification(
 }
 
 #[cfg(target_os = "macos")]
-fn desktop_notification_command(_urgency: &str, title: &str, body: Option<&str>) -> Command {
+pub fn desktop_notification_command(_urgency: &str, title: &str, body: Option<&str>) -> Command {
     let quote = |text: &str| format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""));
     let script = format!(
         "display notification {} with title {}",
@@ -134,7 +157,7 @@ fn desktop_notification_command(_urgency: &str, title: &str, body: Option<&str>)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn desktop_notification_command(urgency: &str, title: &str, body: Option<&str>) -> Command {
+pub fn desktop_notification_command(urgency: &str, title: &str, body: Option<&str>) -> Command {
     let mut command = Command::new("notify-send");
     command
         .arg("--app-name=herdr-triggers")
