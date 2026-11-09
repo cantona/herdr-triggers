@@ -82,17 +82,32 @@ and state dir it resolved to.
 ## Desktop app (herdr-core)
 
 The same daemon watches the Herdr desktop app's terminals, which live in
-herdr-core: `herdr-triggersd --host core ...`. `mods/herdr-triggers` is the
-app side: a dialog (`ctrl-alt-g`, `cmd-alt-g` on macOS) with the daemon's
-status and controls, and a sidebar block that starts the daemon with
-`--follow-app` when the window opens; such a daemon exits once the app has
-been closed for 10 s. `RECIPE.md` has the install
-steps and what differs on that host: notifications are desktop
-notifications, `tab_mark` needs the window open, and `[settings] source` is
-ignored. Rules, secrets and timing are shared code, so a `triggers.toml`
-behaves the same on both hosts. The app side reads it from
-`~/.config/herdr-triggers/`, usually a symlink to the plugin's config
-directory.
+herdr-core: `herdr-triggersd --host core ...`. Two commands set it up:
+
+```sh
+cargo install --locked --git https://github.com/cantona/herdr-triggers
+herdr-triggersd install          # shows the plan, asks y/N
+```
+
+`install` writes the mod (`mods/herdr-triggers`: a dialog on `ctrl-alt-g`,
+`cmd-alt-g` on macOS, and an optional sidebar status block), adds those two
+bindings to the app's `keys.json` without overwriting a key you have bound
+elsewhere (open the app once first, so that file exists; once edited, the
+app stops adding its new default shortcuts to it, and install rewrites its
+formatting), links `~/.config/herdr-triggers` to the TUI plugin's config
+directory when that exists, and installs a login service: a systemd user
+unit on Linux (skipped where systemd does not run, and `start` then runs
+the daemon detached; run install from your desktop session, since a `su`
+or cron session cannot reach the user manager), a launchd agent on macOS. The service runs
+`herdr-triggersd --host core service`, which waits for herdr-core's socket,
+attaches when the core answers, and goes back to waiting 30 s after it
+stops answering, so the daemon no longer depends on the app's window or
+layout. `--dry-run` prints the plan only, `--yes` applies without asking,
+and `uninstall` reverses it. `RECIPE.md` has the details and what differs on that host:
+notifications are desktop notifications, `tab_mark` needs the window open,
+and `[settings] source` is ignored. Rules, secrets and timing are shared
+code, so a `triggers.toml` behaves the same on both hosts. The app side
+reads it from `~/.config/herdr-triggers/`.
 
 ## Example: automated login
 
