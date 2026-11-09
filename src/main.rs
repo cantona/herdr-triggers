@@ -9,6 +9,7 @@ mod client;
 mod config;
 mod core;
 mod engine;
+mod install;
 mod log;
 mod rules;
 mod server;
@@ -17,17 +18,24 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use client::Client;
+use install::service::Installed;
 
 const PLUGIN_ID: &str = "cantona.herdr-triggers";
 const USAGE: &str = "\
 usage: herdr-triggersd [--host herdr|core] [--follow-app] <command> [--session <name> | --socket <path> | --all]
+       herdr-triggersd install|uninstall [--yes | --dry-run]
 
 A daemon runs per server. --host picks the kind of server (default herdr):
   herdr   a herdr TUI server, as the plugin uses it
   core    herdr-core, the Herdr desktop app's terminals
 --follow-app: a core daemon this starts exits once the Herdr app has been
-closed for 10 s (the app's mod passes it).
+closed for 10 s (kept for 0.2.0 mods and scripts; nothing in 0.2.1 uses it).
 
+install sets up the Herdr desktop app: the mod, its keys.json bindings, the
+~/.config/herdr-triggers link to the TUI plugin's config, and a login service
+(systemd user unit or launchd agent) running `--host core service`. It prints
+the plan and asks; --yes applies without asking, --dry-run only prints.
+Without a terminal and without --yes it exits 2. uninstall reverses it.
 
 With no target, the command acts on the server the calling shell belongs to -
 which is whichever pane you happen to be in, so be explicit when it matters:
@@ -37,7 +45,9 @@ which is whichever pane you happen to be in, so be explicit when it matters:
   --socket <path>    a server's socket directly
   --all              every server of that host found on this machine
 
-  start          detach and run the trigger daemon (idempotent)
+  start          detach and run the trigger daemon (idempotent); aimed at
+                 the default core with the login service installed, starts
+                 the service instead
   restart        stop a running daemon, then start a fresh one
   run            run the daemon in the foreground
   service        (--host core) foreground daemon for a service manager: waits
@@ -65,7 +75,7 @@ impl Host {
 }
 
 static HOST: std::sync::OnceLock<Host> = std::sync::OnceLock::new();
-/// `--follow-app`: a core daemon started by the app's mod leaves with it.
+/// `--follow-app`: a core daemon started by a 0.2.0 mod leaves with the app.
 static FOLLOW_APP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn host() -> Host {
@@ -95,6 +105,9 @@ fn take_host(args: &mut Vec<String>) -> Result<Host, String> {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let explicit_host = args
+        .first()
+        .is_some_and(|arg| arg == "--host" || arg.starts_with("--host="));
     let host = match take_host(&mut args) {
         Ok(host) => host,
         Err(message) => {
@@ -107,6 +120,22 @@ fn main() {
         args.remove(0);
     }
     let command = args.first().cloned().unwrap_or_default();
+    if command == "install" || command == "uninstall" {
+        if (explicit_host && host != Host::Core) || follow_app {
+            eprintln!(
+                "{command} sets up the Herdr desktop app (--host core) and takes no other flags; \
+                 the TUI plugin installs with `herdr plugin install`\n\n{USAGE}"
+            );
+            std::process::exit(2);
+        }
+        let _ = HOST.set(Host::Core);
+        let direction = if command == "install" {
+            install::Direction::Install
+        } else {
+            install::Direction::Uninstall
+        };
+        std::process::exit(install_main(direction, &args[1..]));
+    }
     let _ = HOST.set(host);
     if follow_app {
         // Only a core daemon watches the app; on herdr the flag would be
@@ -295,14 +324,20 @@ fn run_for_every_server(host: Host, command: &str, json: bool) -> i32 {
 
 fn config_dir() -> PathBuf {
     match host() {
-        Host::Herdr => env_dir("HERDR_PLUGIN_CONFIG_DIR").unwrap_or_else(|| {
-            herdr_config_dir()
-                .join("plugins")
-                .join("config")
-                .join(PLUGIN_ID)
-        }),
+        Host::Herdr => tui_config_dir(),
         Host::Core => core::paths::config_dir(),
     }
+}
+
+/// The TUI plugin's config directory, which `install` links the core
+/// host's config to.
+fn tui_config_dir() -> PathBuf {
+    env_dir("HERDR_PLUGIN_CONFIG_DIR").unwrap_or_else(|| {
+        herdr_config_dir()
+            .join("plugins")
+            .join("config")
+            .join(PLUGIN_ID)
+    })
 }
 
 /// State lives per SERVER, not per plugin (see `session_tag`).
@@ -380,17 +415,21 @@ fn env_dir(key: &str) -> Option<PathBuf> {
 }
 
 fn herdr_config_dir() -> PathBuf {
-    match std::env::var("XDG_CONFIG_HOME") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("herdr"),
-        _ => home().join(".config").join("herdr"),
-    }
+    xdg_dir("XDG_CONFIG_HOME")
+        .unwrap_or_else(|| home().join(".config"))
+        .join("herdr")
 }
 
 fn herdr_state_dir() -> PathBuf {
-    match std::env::var("XDG_STATE_HOME") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("herdr"),
-        _ => home().join(".local").join("state").join("herdr"),
-    }
+    xdg_dir("XDG_STATE_HOME")
+        .unwrap_or_else(|| home().join(".local").join("state"))
+        .join("herdr")
+}
+
+/// An XDG base directory variable; a relative value is ignored, as the XDG
+/// spec says, so nothing resolves against the working directory.
+fn xdg_dir(name: &str) -> Option<PathBuf> {
+    env_dir(name).filter(|dir| dir.is_absolute())
 }
 
 fn home() -> PathBuf {
@@ -432,6 +471,19 @@ fn start() -> i32 {
             }
         }
     }
+    match supervising_service() {
+        Some(Installed::Unreachable { why, .. }) => return refuse_unreachable(None, &why),
+        Some(Installed::Reachable(service)) => match start_service(&service) {
+            Ok(()) => return 0,
+            // No user bus in this session, a unit the manager cannot find:
+            // triggers still run, just not supervised.
+            Err(message) => {
+                eprintln!("{message}");
+                eprintln!("starting a detached daemon instead");
+            }
+        },
+        None => {}
+    }
     // Detach before anything spawns a thread: fork() in a threaded process only
     // carries the calling thread into the child.
     match detach() {
@@ -459,16 +511,89 @@ fn already_running(pid: i32) {
 /// Stops the daemon and returns once it has exited, so a status read right
 /// after says "stopped".
 fn stop() -> i32 {
+    match supervising_service() {
+        Some(Installed::Reachable(service)) => return stop_through_service(&service, false),
+        Some(Installed::Unreachable { why, .. }) => return refuse_unreachable(running_pid(), &why),
+        None => {}
+    }
     let Some(pid) = running_pid() else {
         eprintln!("herdr-triggersd is not running");
         return 1;
     };
+    signal_and_wait(pid)
+}
+
+/// SIGTERM to daemon `pid`, then waits for it to exit.
+fn signal_and_wait(pid: i32) -> i32 {
     let code = signal_daemon(libc::SIGTERM, "stop");
     if code != 0 {
         return code;
     }
+    report_exit(pid)
+}
+
+/// `stop` aimed at the service's core with the service installed. The
+/// manager stops the service, since it would start again a daemon that a
+/// signal ended, and Stop is meant to hold until Start. A daemon the
+/// service did not start is signalled after that, when no service waits to
+/// take its place; the manager cannot restart it, so that also happens when
+/// the manager fails. `restarting` drops the "not running" note and reports
+/// a manager failure as a warning, since the start that follows may still
+/// succeed.
+fn stop_through_service(service: &install::service::Location, restarting: bool) -> i32 {
+    let pid = running_pid();
+    let service_daemon = pid.is_some() && is_service_daemon();
+    let name = service.manager.name();
+    let managed = match install::service::stop_installed(
+        service.manager,
+        install::service::uid(),
+        install::service::probe_cmd,
+    ) {
+        Some(cmd) => install::service::run_cmd(&cmd).map(|()| {
+            println!("stopped the {name} service ({cmd})");
+        }),
+        None => Ok(()),
+    };
+    if let Err(message) = &managed {
+        if restarting {
+            eprintln!("warning: {message}");
+        } else {
+            eprintln!("{message}");
+        }
+    }
+    let code = match pid {
+        None => {
+            if !restarting && managed.is_ok() {
+                println!("herdr-triggersd is not running; the {name} service stays stopped");
+            }
+            0
+        }
+        Some(pid) if service_daemon && managed.is_err() => {
+            eprintln!("not signalling pid {pid}: the {name} service would start it again");
+            1
+        }
+        Some(pid) if service_daemon => report_exit(pid),
+        Some(pid) => signal_and_wait(pid),
+    };
+    if managed.is_err() {
+        1
+    } else {
+        code
+    }
+}
+
+/// Waits for daemon `pid` to exit after a stop and says how it went.
+fn report_exit(pid: i32) -> i32 {
     match wait_for_exit(pid) {
         Exit::Gone => 0,
+        // The service was waiting behind this daemon; that is the outcome
+        // a stop of a stray daemon is meant to have.
+        Exit::Replaced(now) if is_service_daemon() => {
+            println!(
+                "herdr-triggersd (pid {pid}) stopped; the login service took over (pid {now})"
+            );
+            0
+        }
         Exit::Replaced(now) => {
             eprintln!(
                 "herdr-triggersd (pid {pid}) stopped, but a start launched pid {now} meanwhile"
@@ -519,6 +644,23 @@ fn wait_for_exit(pid: i32) -> Exit {
 /// guessed interval: `start` refuses while the lock is held, so returning too
 /// early would leave nothing running at all.
 fn restart() -> i32 {
+    match supervising_service() {
+        Some(Installed::Unreachable { why, .. }) => {
+            return refuse_unreachable(running_pid(), &why);
+        }
+        Some(Installed::Reachable(service)) => {
+            let code = stop_through_service(&service, true);
+            // A manager that refused the stop has already been reported.
+            // With nothing left running the start still goes ahead: it
+            // delegates, or falls back to a detached daemon, rather than
+            // leave triggers off.
+            if code != 0 && running_pid().is_some() {
+                return code;
+            }
+            return start();
+        }
+        None => {}
+    }
     if let Some(pid) = running_pid() {
         let code = signal_daemon(libc::SIGTERM, "stop");
         if code != 0 {
@@ -548,6 +690,167 @@ fn restart() -> i32 {
 fn run_foreground() -> i32 {
     daemon_main();
     0
+}
+
+/// start, stop or restart aimed at a service this session cannot reach:
+/// nothing is signalled or started. A signal would be undone 5s later
+/// (Restart=always), and a detached daemon would hold the lock against the
+/// service the manager restarts.
+fn refuse_unreachable(pid: Option<i32>, why: &str) -> i32 {
+    if let Some(pid) = pid.filter(|_| is_service_daemon()) {
+        eprintln!("not signalling pid {pid}: the systemd service would start it again");
+    }
+    eprintln!("{}", install::service::unreachable_message(why));
+    1
+}
+
+/// The login service that would run this daemon, when it is installed and
+/// this command resolved the core it watches. Flags are not the test: a
+/// shell in core session "work" names it only through HC_SESSION or
+/// HC_SOCKET, while `--all` reaches the default core with `--socket`.
+fn supervising_service() -> Option<Installed> {
+    if host() != Host::Core || service_watches_this_core() != Some(true) {
+        return None;
+    }
+    install::service::installed(&home(), &mut DaemonSystem)
+}
+
+/// Whether this command resolved the core the login service watches.
+/// `None` when either socket cannot be resolved (a broken core config):
+/// then nobody can tell, and nothing delegates.
+fn service_watches_this_core() -> Option<bool> {
+    match (core::paths::socket_path(), core::paths::service_socket()) {
+        (Ok(ours), Ok(watched)) => Some(core::paths::same_socket(&ours, &watched)),
+        _ => None,
+    }
+}
+
+/// `start` with the service installed: the manager starts it, so the daemon
+/// stays supervised instead of detaching beside it.
+fn start_service(service: &install::service::Location) -> Result<(), String> {
+    let cmd = install::service::start_installed(
+        service.manager,
+        install::service::uid(),
+        &service.path,
+        install::service::probe_cmd,
+    );
+    install::service::run_cmd(&cmd)?;
+    println!("started the {} service ({cmd})", service.manager.name());
+    Ok(())
+}
+
+fn install_main(direction: install::Direction, args: &[String]) -> i32 {
+    use std::io::IsTerminal;
+    use std::os::unix::fs::MetadataExt;
+    let mode = match install::parse_mode(args) {
+        Ok(mode) => mode,
+        Err(message) => {
+            eprintln!("{message}\n\n{USAGE}");
+            return 2;
+        }
+    };
+    // Before anything resolves or creates a path.
+    let home_owner = std::fs::metadata(home()).ok().map(|m| m.uid());
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if let Err(message) = install::check_user(unsafe { libc::geteuid() }, home_owner) {
+        eprintln!("error: {message}");
+        return 1;
+    }
+    // The daemon install looks for, stops and starts is the service's, the
+    // default core's, whichever core terminal install runs in.
+    // A broken core config must not block removing the mod, keys or
+    // service, none of which depend on it; the daemon checks then use the
+    // default session's state directory.
+    match core::paths::service_socket() {
+        Ok(socket) => core::paths::set_socket_override(socket),
+        Err(message) => {
+            eprintln!("warning: {message}; checking the default session's daemon");
+            core::paths::set_session_override(core::paths::DEFAULT_SESSION.to_string());
+        }
+    }
+    let ctx = match install::Context::from_env(tui_config_dir()) {
+        Ok(ctx) => ctx,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return 1;
+        }
+    };
+    let mut sys = DaemonSystem;
+    let plan = match install::plan(&ctx, direction, &mut sys) {
+        Ok(plan) => plan,
+        Err(message) => {
+            eprintln!("error: {message}\nnothing was changed");
+            return 1;
+        }
+    };
+    let stdin = std::io::stdin();
+    let tty = stdin.is_terminal() && std::io::stderr().is_terminal();
+    install::execute(
+        &plan,
+        direction,
+        mode,
+        install::Terminal {
+            tty,
+            input: &mut stdin.lock(),
+            out: &mut std::io::stdout(),
+            err: &mut std::io::stderr(),
+        },
+        &mut sys,
+    )
+}
+
+/// The real service manager, and this machine's daemon for the core the
+/// service watches (`install_main` points the paths there).
+struct DaemonSystem;
+
+impl install::service::System for DaemonSystem {
+    fn run(&mut self, cmd: &install::service::Cmd) -> Result<(), String> {
+        println!("running {cmd}");
+        install::service::run_cmd(cmd)
+    }
+
+    fn succeeds(&mut self, cmd: &install::service::Cmd) -> bool {
+        install::service::probe_cmd(cmd)
+    }
+
+    fn output(&mut self, cmd: &install::service::Cmd) -> Result<String, String> {
+        install::service::output_cmd(cmd)
+    }
+
+    fn systemd_booted(&mut self) -> bool {
+        install::service::systemd_booted()
+    }
+
+    fn foreign_daemon(&mut self) -> Option<i32> {
+        running_pid().filter(|_| !is_service_daemon())
+    }
+
+    fn service_daemon_running(&mut self) -> bool {
+        running_pid().is_some() && is_service_daemon()
+    }
+
+    /// Done once `pid` lets go of the lock, even if another daemon took it
+    /// then: a service waiting behind `pid` does exactly that.
+    fn stop_daemon(&mut self, pid: i32) -> Result<(), String> {
+        match running_pid() {
+            Some(now) if now == pid => {}
+            _ => return Ok(()),
+        }
+        if signal_daemon(libc::SIGTERM, "stop") != 0 {
+            return Err(format!("could not stop herdr-triggersd (pid {pid})"));
+        }
+        match wait_for_exit(pid) {
+            Exit::Gone => Ok(()),
+            Exit::Replaced(_) if is_service_daemon() => Ok(()),
+            Exit::Replaced(now) => Err(format!(
+                "herdr-triggersd (pid {pid}) stopped, but another daemon (pid {now}) took its place"
+            )),
+            Exit::Stuck => Err(format!(
+                "herdr-triggersd (pid {pid}) still holds the lock after {}s",
+                STOP_WAIT.as_secs()
+            )),
+        }
+    }
 }
 
 /// `--host core service`: waits for herdr-core, runs the engine while it is
@@ -645,14 +948,15 @@ fn daemon_prologue(mode: &str, wait: bool) -> Prologue {
             return Prologue::Stopped;
         }
     }
+    // How this daemon was started, for `status`, for a start from the app
+    // that finds it already running, and for `install`, which stops any
+    // daemon the service did not start. Written before the pidfile: a `stop`
+    // that sees the new pid reads the mode to tell a service that took over.
+    let _ = std::fs::write(mode_path(), format!("{mode}\n"));
     write_pidfile();
     let _ = std::fs::remove_file(stopping_path());
     // A killed service leaves its marker behind; this daemon is not waiting.
     let _ = std::fs::remove_file(waiting_path());
-    // How this daemon was started, for `status`, for a start from the app
-    // that finds it already running, and for `install`, which stops any
-    // daemon the service did not start.
-    let _ = std::fs::write(mode_path(), format!("{mode}\n"));
     install_signal_handlers();
     Prologue::Ready(state_dir)
 }
@@ -892,6 +1196,19 @@ fn is_waiting(pid: Option<i32>) -> bool {
     pid.is_some() && waiting_path().exists()
 }
 
+fn service_json() -> serde_json::Value {
+    let installed = install::service::installed(&home(), &mut DaemonSystem);
+    serde_json::json!({
+        "installed": installed.is_some(),
+        "manager": installed.as_ref().map(|i| i.manager().name()),
+        // null when not installed; false when this session cannot reach it.
+        "reachable": installed
+            .as_ref()
+            .map(|i| matches!(i, Installed::Reachable(_))),
+        "this_core": service_watches_this_core(),
+    })
+}
+
 fn stopping_path() -> PathBuf {
     state_dir().join("triggersd.stopping")
 }
@@ -943,6 +1260,23 @@ fn status() -> i32 {
     if is_waiting(pid) {
         println!("waiting for herdr-core");
     }
+    if host() == Host::Core {
+        match install::service::installed(&home(), &mut DaemonSystem) {
+            Some(installed) => {
+                let mut line = format!("service: {} installed", installed.manager().name());
+                if service_watches_this_core() == Some(false) {
+                    line.push_str(" (watches the default core, not this one)");
+                }
+                if let Installed::Unreachable { why, .. } = &installed {
+                    line.push_str(&format!(
+                        " (manager not reachable from this session: {why})"
+                    ));
+                }
+                println!("{line}");
+            }
+            None => println!("service: not installed (herdr-triggersd install)"),
+        }
+    }
     let triggers = config_dir().join("triggers.toml");
     match config::load_triggers(&triggers) {
         Ok(loaded) => println!("{} rules in {}", loaded.rules.len(), triggers.display()),
@@ -982,6 +1316,8 @@ fn status_json() -> i32 {
         "state_dir": state_dir().display().to_string(),
         "running": pid.is_some(),
         "waiting": is_waiting(pid),
+        // The service runs a core daemon; a TUI daemon has none.
+        "service": (host() == Host::Core).then(service_json),
         "follows_app": pid.is_some() && follows_app(),
         "pid": pid,
         "config": triggers.display().to_string(),

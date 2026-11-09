@@ -69,19 +69,18 @@ pub struct SocketInputs {
 
 impl SocketInputs {
     pub fn from_env() -> Result<Self, String> {
-        let home = home_dir();
-        let config_home = non_empty("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
         // SAFETY: getuid has no preconditions and cannot fail.
         let uid = unsafe { libc::getuid() };
         let run_user = PathBuf::from(format!("/run/user/{uid}"));
         Ok(Self {
             session: session(),
             hc_socket: non_empty("HC_SOCKET"),
-            config_socket: core_config_socket(&config_home.join("herdr-core").join("config.toml"))?,
+            config_socket: core_config_socket(
+                &config_home().join("herdr-core").join("config.toml"),
+            )?,
             runtime_dir: non_empty("XDG_RUNTIME_DIR"),
             run_user_dir: run_user.is_dir().then_some(run_user),
-            state_home: non_empty("XDG_STATE_HOME")
-                .unwrap_or_else(|| home.join(".local").join("state")),
+            state_home: state_home(),
         })
     }
 }
@@ -104,12 +103,31 @@ pub fn socket_path() -> Result<PathBuf, String> {
     Ok(resolve_socket(&inputs))
 }
 
+/// The socket the login service resolves. It runs with neither HC_SESSION
+/// nor HC_SOCKET (those belong to a core terminal), so it always watches the
+/// default session, wherever core's config puts it.
+pub fn service_socket() -> Result<PathBuf, String> {
+    Ok(resolve_socket(&as_service(SocketInputs::from_env()?)))
+}
+
 /// `inputs` as the service sees them.
 pub fn as_service(inputs: SocketInputs) -> SocketInputs {
     SocketInputs {
         session: DEFAULT_SESSION.to_string(),
         hc_socket: None,
         ..inputs
+    }
+}
+
+/// Whether two resolved sockets are the same core. A path given with
+/// `--socket` may name it through a symlink or a relative path.
+pub fn same_socket(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -173,37 +191,46 @@ fn discover_in(inputs: &SocketInputs) -> Vec<(String, PathBuf)> {
     found
 }
 
-/// The Herdr desktop app's control socket: in `HERDR_APP_HOME`, else
-/// `herdr-app` under the config home. It stays on disk after the app quits;
-/// only a refused connection tells that it is gone.
+/// The Herdr desktop app's home: `HERDR_APP_HOME`, else `herdr-app` under
+/// the config home. Its mods and `keys.json` live here.
+pub fn app_home() -> PathBuf {
+    non_empty("HERDR_APP_HOME").unwrap_or_else(|| config_home().join("herdr-app"))
+}
+
+/// The app's control socket, in its home. It stays on disk after the app
+/// quits; only a refused connection tells that it is gone.
 pub fn app_socket() -> PathBuf {
-    non_empty("HERDR_APP_HOME")
-        .unwrap_or_else(|| {
-            non_empty("XDG_CONFIG_HOME")
-                .unwrap_or_else(|| home_dir().join(".config"))
-                .join("herdr-app")
-        })
-        .join("herdr-app.sock")
+    app_home().join("herdr-app.sock")
+}
+
+/// `XDG_CONFIG_HOME`, else `~/.config`. A relative value is ignored, as the
+/// XDG spec says: it would resolve against whatever the working directory
+/// is, so a detached daemon and a later command could disagree.
+pub fn config_home() -> PathBuf {
+    xdg_base(non_empty("XDG_CONFIG_HOME"), &home_dir(), ".config")
+}
+
+/// `XDG_STATE_HOME`, else `~/.local/state`, with the same rule.
+pub fn state_home() -> PathBuf {
+    xdg_base(non_empty("XDG_STATE_HOME"), &home_dir(), ".local/state")
+}
+
+fn xdg_base(xdg: Option<PathBuf>, home: &Path, fallback: &str) -> PathBuf {
+    xdg.filter(|dir| dir.is_absolute())
+        .unwrap_or_else(|| home.join(fallback))
 }
 
 /// `~/.config/herdr-triggers`, or `HERDR_TRIGGERS_CONFIG_DIR`.
 pub fn config_dir() -> PathBuf {
-    non_empty("HERDR_TRIGGERS_CONFIG_DIR").unwrap_or_else(|| {
-        non_empty("XDG_CONFIG_HOME")
-            .unwrap_or_else(|| home_dir().join(".config"))
-            .join("herdr-triggers")
-    })
+    non_empty("HERDR_TRIGGERS_CONFIG_DIR").unwrap_or_else(|| config_home().join("herdr-triggers"))
 }
 
 /// `~/.local/state/herdr-triggers/core-<server>`, or that tag under
 /// `HERDR_TRIGGERS_STATE_DIR`. The session is part of the path for the same
 /// reason as on the herdr host: one daemon per server, each with its own lock.
 pub fn state_dir() -> PathBuf {
-    let base = non_empty("HERDR_TRIGGERS_STATE_DIR").unwrap_or_else(|| {
-        non_empty("XDG_STATE_HOME")
-            .unwrap_or_else(|| home_dir().join(".local").join("state"))
-            .join("herdr-triggers")
-    });
+    let base = non_empty("HERDR_TRIGGERS_STATE_DIR")
+        .unwrap_or_else(|| state_home().join("herdr-triggers"));
     base.join(format!("core-{}", filesystem_safe(&server_tag())))
 }
 
@@ -257,7 +284,7 @@ fn non_empty(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn home_dir() -> PathBuf {
+pub fn home_dir() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_default()
 }
 
@@ -299,6 +326,57 @@ mod tests {
         assert_eq!(resolve_socket(&i), PathBuf::from("/srv/hc.sock"));
         i.hc_socket = Some("/x/hc.sock".into());
         assert_eq!(resolve_socket(&i), PathBuf::from("/x/hc.sock"));
+    }
+
+    #[test]
+    fn only_a_command_aimed_at_the_default_core_matches_the_service() {
+        let mut ambient = inputs();
+        ambient.runtime_dir = Some("/rt".into());
+        let service = resolve_socket(&as_service(ambient.clone()));
+        assert_eq!(service, PathBuf::from("/rt/herdr-core/default.sock"));
+        assert!(same_socket(&resolve_socket(&ambient), &service));
+
+        // A shell inside core session "work", by HC_SESSION or HC_SOCKET.
+        let mut work = ambient.clone();
+        work.session = "work".into();
+        assert!(!same_socket(&resolve_socket(&work), &service));
+        let mut work = ambient.clone();
+        work.hc_socket = Some("/rt/herdr-core/work.sock".into());
+        assert!(!same_socket(&resolve_socket(&work), &service));
+
+        // A terminal of the default core carries HC_SOCKET too.
+        let mut default = ambient.clone();
+        default.hc_socket = Some("/rt/herdr-core/default.sock".into());
+        assert!(same_socket(&resolve_socket(&default), &service));
+
+        // `--socket` from `--all`, or typed: the path itself is compared.
+        assert!(same_socket(
+            Path::new("/rt/herdr-core/default.sock"),
+            &service
+        ));
+        assert!(!same_socket(
+            Path::new("/rt/herdr-core/work.sock"),
+            &service
+        ));
+
+        // core's config moves the socket for the service as well.
+        ambient.config_socket = Some("/srv/hc.sock".into());
+        let moved = resolve_socket(&as_service(ambient.clone()));
+        assert_eq!(moved, PathBuf::from("/srv/hc.sock"));
+        assert!(same_socket(&resolve_socket(&ambient), &moved));
+    }
+
+    #[test]
+    fn a_socket_named_through_a_symlink_is_the_same_socket() {
+        let dir = std::env::temp_dir().join(format!("triggers-same-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("default.sock");
+        std::fs::write(&real, "").unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("link.sock")).unwrap();
+        assert!(same_socket(&dir.join("link.sock"), &real));
+        assert!(!same_socket(&dir.join("missing.sock"), &real));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -357,6 +435,27 @@ mod tests {
         let names: Vec<String> = discover_in(&i).into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["default"]);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_relative_xdg_base_is_ignored() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            xdg_base(None, home, ".config"),
+            Path::new("/home/u/.config")
+        );
+        assert_eq!(
+            xdg_base(Some("/x/cfg".into()), home, ".config"),
+            Path::new("/x/cfg")
+        );
+        assert_eq!(
+            xdg_base(Some("cfg".into()), home, ".config"),
+            Path::new("/home/u/.config")
+        );
+        assert_eq!(
+            xdg_base(Some("state".into()), home, ".local/state"),
+            Path::new("/home/u/.local/state")
+        );
     }
 
     #[test]

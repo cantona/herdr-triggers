@@ -1,8 +1,8 @@
 // Herdr Triggers: herdr-triggersd on herdr-core, seen from the app.
-// One View, two renders. As a sidebar block (props.strip) it starts the
-// daemon when the window opens; the daemon leaves by itself once the app
-// has quit (--follow-app). As the dialog ctrl-alt-g opens it shows status
-// and runs the daemon's commands. Every fact is one
+// One View, two renders. The daemon is a login service that
+// `herdr-triggersd install` sets up; nothing here starts it on its own. As a
+// sidebar block (props.strip) this is a status dot. As the dialog ctrl-alt-g
+// opens it shows status and runs the daemon's commands. Every fact is one
 // `herdr-triggersd --host core status --json`. Copies share only the state
 // word and rule count: shared() is persisted to a file other local users can
 // read, and the status carries log lines the daemon keeps owner-only.
@@ -11,13 +11,15 @@ import { v_flex, h_flex } from "gpui-base";
 import { exec, props, closeOverlay, theme, notify, run, layout, layouts, shared, setShared } from "herdr";
 
 const BIN = "herdr-triggersd";
-// --follow-app: a daemon this starts leaves on its own once the app quits.
-const HOST = ["--host", "core", "--follow-app"];
+const HOST = ["--host", "core"];
 const INSTALL = "cargo install --locked --git https://github.com/cantona/herdr-triggers";
+const SETUP = "herdr-triggersd install";
 const STATUS_KEY = "herdr-triggers.status";
-// Set by Stop, cleared by Start and Restart: while it is set the block does
-// not start the daemon, so a Stop outlasts a layout switch or a mod reload.
-const HOLD_KEY = "herdr-triggers.hold";
+// The block reads status once when it opens, often while the service is
+// still waiting for herdr-core to come up beside the app; a few spaced
+// re-reads let the dot settle without a standing timer.
+const SETTLE_TRIES = 5;
+const SETTLE_MS = 3000;
 const BLOCK_ID = "herdr-triggers";
 const SHIPPED = ["main", "terminals", "win98"];
 
@@ -47,7 +49,17 @@ function withoutNode(node, id) {
 // What the block needs, and all that leaves the dialog.
 function brief(s) {
   if (s.install || s.error) return { word: "error", rules: null };
-  return { word: s.data.running ? "running" : "stopped", rules: s.data.config_error ? null : s.data.rules ?? 0 };
+  const word = !s.data.running ? "stopped" : s.data.waiting ? "waiting" : "running";
+  return { word, rules: s.data.config_error ? null : s.data.rules ?? 0 };
+}
+
+function serviceText(service) {
+  if (!service?.installed) return `not installed; run ${SETUP}`;
+  let text = `${service.manager}: installed`;
+  if (service.this_core === false) text += ", watches the default core, not this one";
+  // An older herdr-triggersd has no `reachable` field: only false says so.
+  if (service.reachable === false) text += " (not reachable from here)";
+  return text;
 }
 
 async function readStatus() {
@@ -79,17 +91,12 @@ export default class Triggers extends View {
     this.error = null;
     this.status = null;
     if (this.strip) {
-      // The window opening is what starts the daemon; `start` is idempotent.
       cx.spawn(async (cx) => {
-        if (shared(HOLD_KEY) !== true) {
-          try {
-            // Longer than start's own wait for a stopping daemon (30s).
-            await exec(BIN, [...HOST, "start"], { timeout: 45000 });
-          } catch (_) {
-            // Reported by the status read below.
-          }
-        }
         await this.refresh(cx);
+        for (let i = 0; i < SETTLE_TRIES && shared(STATUS_KEY)?.word === "waiting"; i++) {
+          await cx.sleep(SETTLE_MS);
+          await this.refresh(cx);
+        }
       });
     } else {
       this.handle = cx.focus_handle();
@@ -115,10 +122,6 @@ export default class Triggers extends View {
     this.busy = name;
     this.error = null;
     cx.notify();
-    // Stop sets the hold before it runs, so a block that starts while the
-    // daemon is still stopping (a layout switch) does not start it again,
-    // and keeps it whatever stop reports: pressing Stop is what counts.
-    if (name === "stop") setShared(HOLD_KEY, true);
     cx.spawn(async (cx) => {
       try {
         let r;
@@ -127,8 +130,6 @@ export default class Triggers extends View {
         } catch (e) {
           r = { code: 1, stderr: String(e), stdout: "" };
         }
-        // Only a Start or Restart that worked clears the hold.
-        if (r.code === 0 && (name === "start" || name === "restart")) setShared(HOLD_KEY, false);
         if (r.code !== 0) notify({ title: `Herdr Triggers: ${name} failed`, body: summary(r.stderr || r.stdout) || `exited with code ${r.code}`, level: "error" });
         await this.refresh(cx);
       } finally {
@@ -204,7 +205,7 @@ export default class Triggers extends View {
 
   stateWord(t, b) {
     if (!b) return ["reading", t.muted];
-    const color = { running: t.working, stopped: t.idle, error: t.blocked }[b.word] ?? t.muted;
+    const color = { running: t.working, waiting: t.idle, stopped: t.idle, error: t.blocked }[b.word] ?? t.muted;
     return [b.word, color];
   }
 
@@ -241,9 +242,9 @@ export default class Triggers extends View {
       .child(div().text_color(color ?? t.muted).child(right));
     const label = (text) => div().pt(12).pb(4).text_size(11.5).text_color(t.dim).child(text);
     const items = [label("Daemon")];
-    items.push(row("pid", "Process", d.running ? `pid ${d.pid}` : "not running", d.running ? t.working : t.idle));
-    if (d.running) items.push(row("follow", "Leaves when the app quits", d.follows_app ? "yes" : "no: Restart to fix", d.follows_app ? t.muted : t.blocked));
-    else if (shared(HOLD_KEY) === true) items.push(row("hold", "The sidebar starts it", "no: held by Stop until Start", t.muted));
+    const process = !d.running ? "not running" : d.waiting ? `pid ${d.pid}, waiting for herdr-core` : `pid ${d.pid}`;
+    items.push(row("pid", "Process", process, d.running && !d.waiting ? t.working : t.idle));
+    items.push(row("service", "Service", serviceText(d.service), d.service?.installed ? t.muted : t.blocked));
     items.push(row("socket", "herdr-core", d.socket));
     items.push(row("config", d.config, d.config_error ? "config error" : `${d.rules ?? 0} rules`, d.config_error ? t.blocked : t.muted));
     if (d.config_error) items.push(div().pl(12).text_color(t.blocked).child(d.config_error));
@@ -263,6 +264,7 @@ export default class Triggers extends View {
       .child(div().text_color(t.blocked).child(s.install))
       .child(div().text_color(t.muted).child("Install the current version, then open this dialog again:"))
       .child(div().text_color(t.foreground).child(INSTALL))
+      .child(div().text_color(t.foreground).child(SETUP))
       .child(div().text_size(11.5).text_color(t.dim).child(s.error ?? ""));
     else if (s.error) body = div().text_color(t.blocked).child(s.error);
     else body = this.facts(t, s.data);
