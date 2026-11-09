@@ -223,3 +223,272 @@ fn the_daemon_fires_once_through_a_fake_core_and_leaves_when_it_does() {
     assert!(log.contains("server is gone"), "{log}");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// The binary with every path it could touch pointed into `root`, and no
+/// ambient core or app.
+fn isolated(root: &Path) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("home/.config"))
+        .env("XDG_STATE_HOME", root.join("home/.local/state"))
+        .env("HERDR_APP_HOME", root.join("home/.config/herdr-app"))
+        .env("HERDR_TRIGGERS_CONFIG_DIR", root.join("config"))
+        .env("HERDR_TRIGGERS_STATE_DIR", root.join("state"))
+        .env_remove("HC_SOCKET")
+        .env_remove("HC_SESSION")
+        .env_remove("HERDR_PLUGIN_CONFIG_DIR")
+        .env_remove("XDG_RUNTIME_DIR");
+    cmd
+}
+
+fn status_json(root: &Path, socket: &Path) -> Value {
+    let out = isolated(root)
+        .args(["--host", "core", "status", "--json", "--socket"])
+        .arg(socket)
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+fn service_root(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let root = fresh_dir(tag);
+    let config = root.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("triggers.toml"),
+        "[settings]\npoll_ms = 50\nfire_on_existing_text = true\n\n\
+         [[rules]]\nregex = \"Password:\"\nonce = true\ntail_within = 1\n\
+         action = { type = \"send_text\", text = \"hunter2\\n\" }\n",
+    )
+    .unwrap();
+    let state = root.join("state").join("core-default");
+    let socket = root.join("default.sock");
+    (root, state, socket)
+}
+
+fn spawn_service(root: &Path, socket: &Path) -> std::process::Child {
+    isolated(root)
+        .args(["--host", "core", "service", "--socket"])
+        .arg(socket)
+        .env("HERDR_TRIGGERS_CORE_PATIENCE_MS", "1000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+fn stop_service(root: &Path, socket: &Path, daemon: &mut std::process::Child) {
+    let stop = isolated(root)
+        .args(["--host", "core", "stop", "--socket"])
+        .arg(socket)
+        .output()
+        .unwrap();
+    assert!(stop.status.success(), "{stop:?}");
+    let exited = wait_until(Duration::from_secs(5), || {
+        daemon.try_wait().unwrap().is_some()
+    });
+    if !exited {
+        let _ = daemon.kill();
+    }
+    assert!(exited, "the service did not exit after stop");
+    assert_eq!(daemon.wait().unwrap().code(), Some(0));
+}
+
+#[test]
+fn the_service_waits_for_core_attaches_and_reattaches_after_it_leaves() {
+    let (root, state, socket) = service_root("service");
+    let log = || std::fs::read_to_string(state.join("triggersd.log")).unwrap_or_default();
+    let marker = state.join("triggersd.waiting");
+    let mut daemon = spawn_service(&root, &socket);
+
+    assert!(
+        wait_until(Duration::from_secs(5), || marker.exists()),
+        "no waiting marker; log: {}",
+        log()
+    );
+    let waiting = status_json(&root, &socket);
+    assert_eq!(waiting["running"], true);
+    assert_eq!(waiting["waiting"], true);
+    assert_eq!(
+        std::fs::read_to_string(state.join("triggersd.mode")).unwrap(),
+        "service\n"
+    );
+
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let core = fake_core(&socket, "login:\nPassword:", seen.clone(), stop.clone());
+    assert!(
+        wait_until(Duration::from_secs(6), || !seen
+            .lock()
+            .unwrap()
+            .typed
+            .is_empty()),
+        "nothing typed after core appeared; log: {}",
+        log()
+    );
+    assert!(!marker.exists());
+    assert_eq!(status_json(&root, &socket)["waiting"], false);
+
+    // Core leaves: the service goes back to waiting instead of exiting.
+    stop.store(true, Ordering::SeqCst);
+    core.join().unwrap();
+    std::fs::remove_file(&socket).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || marker.exists()),
+        "no waiting marker after core left; log: {}",
+        log()
+    );
+    assert!(daemon.try_wait().unwrap().is_none(), "the service exited");
+    assert!(
+        log().contains("herdr-core gone; waiting for it"),
+        "{}",
+        log()
+    );
+
+    let again = Arc::new(Mutex::new(Seen::default()));
+    let stop_again = Arc::new(AtomicBool::new(false));
+    let core = fake_core(
+        &socket,
+        "login:\nPassword:",
+        again.clone(),
+        stop_again.clone(),
+    );
+    assert!(
+        wait_until(Duration::from_secs(6), || again
+            .lock()
+            .unwrap()
+            .methods
+            .iter()
+            .any(|m| m == "events.subscribe")),
+        "no re-attach to the new core; log: {}",
+        log()
+    );
+    assert!(wait_until(Duration::from_secs(2), || !marker.exists()));
+
+    stop_service(&root, &socket, &mut daemon);
+    stop_again.store(true, Ordering::SeqCst);
+    core.join().unwrap();
+    assert!(!state.join("triggersd.pid").exists());
+    assert!(!marker.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_stop_while_the_service_waits_exits_promptly() {
+    let (root, state, socket) = service_root("service-stop");
+    let marker = state.join("triggersd.waiting");
+    let mut daemon = spawn_service(&root, &socket);
+    assert!(wait_until(Duration::from_secs(5), || marker.exists()));
+
+    // A second service for the same core waits behind the lock, and a stop
+    // ends that wait promptly too.
+    let mut second = spawn_service(&root, &socket);
+    let log = || std::fs::read_to_string(state.join("triggersd.log")).unwrap_or_default();
+    assert!(
+        wait_until(Duration::from_secs(5), || log()
+            .contains("another herdr-triggersd holds the lock; waiting for it")),
+        "{}",
+        log()
+    );
+    assert!(
+        second.try_wait().unwrap().is_none(),
+        "the second service exited"
+    );
+    let at = Instant::now();
+    assert_eq!(unsafe { libc::kill(second.id() as i32, libc::SIGTERM) }, 0);
+    assert!(wait_until(Duration::from_secs(2), || second
+        .try_wait()
+        .unwrap()
+        .is_some()));
+    assert!(at.elapsed() < Duration::from_secs(1), "{:?}", at.elapsed());
+    assert_eq!(second.wait().unwrap().code(), Some(0));
+
+    let at = Instant::now();
+    stop_service(&root, &socket, &mut daemon);
+    assert!(at.elapsed() < Duration::from_secs(2), "{:?}", at.elapsed());
+    assert!(!marker.exists());
+    assert!(!state.join("triggersd.pid").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn a_service_behind_a_held_lock_waits_and_takes_over_when_it_is_released() {
+    use std::os::fd::AsRawFd;
+    let (root, state, socket) = service_root("service-lock");
+    std::fs::create_dir_all(&state).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.join("triggersd.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let log = || std::fs::read_to_string(state.join("triggersd.log")).unwrap_or_default();
+    let mut daemon = spawn_service(&root, &socket);
+    assert!(
+        wait_until(Duration::from_secs(5), || log()
+            .contains("another herdr-triggersd holds the lock; waiting for it")),
+        "{}",
+        log()
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(daemon.try_wait().unwrap().is_none(), "the service exited");
+    assert!(!state.join("triggersd.mode").exists());
+    assert!(!state.join("triggersd.pid").exists());
+    assert_eq!(log().matches("holds the lock").count(), 1, "{}", log());
+
+    drop(held);
+    assert!(
+        wait_until(Duration::from_secs(5), || std::fs::read_to_string(
+            state.join("triggersd.mode")
+        )
+        .is_ok_and(|mode| mode == "service\n")),
+        "the service did not take the lock; log: {}",
+        log()
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.join("triggersd.pid")).unwrap(),
+        format!("{}\n", daemon.id())
+    );
+    assert_eq!(status_json(&root, &socket)["pid"], daemon.id());
+    stop_service(&root, &socket, &mut daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn the_service_watches_the_default_session_whatever_hc_session_says() {
+    let (root, _, _) = service_root("service-default");
+    let run = root.join("run");
+    std::fs::create_dir_all(run.join("herdr-core")).unwrap();
+    let mut daemon = isolated(&root)
+        .args(["--host", "core", "service"])
+        .env("XDG_RUNTIME_DIR", &run)
+        .env("HC_SESSION", "work")
+        .env("HC_SOCKET", run.join("herdr-core/work.sock"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let default = root.join("state/core-default");
+    assert!(
+        wait_until(Duration::from_secs(5), || std::fs::read_to_string(
+            default.join("triggersd.mode")
+        )
+        .is_ok_and(|mode| mode == "service\n")),
+        "no service state in core-default"
+    );
+    assert!(!root.join("state/core-work").exists());
+    let log = || std::fs::read_to_string(default.join("triggersd.log")).unwrap_or_default();
+    assert!(
+        wait_until(Duration::from_secs(5), || log()
+            .contains("herdr-core/default.sock does not answer")),
+        "{}",
+        log()
+    );
+    stop_service(&root, &run.join("herdr-core/default.sock"), &mut daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -11,6 +11,7 @@
 
 pub mod paths;
 pub mod rpc;
+pub mod service;
 pub mod terminals;
 pub mod wire;
 

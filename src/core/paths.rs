@@ -5,12 +5,14 @@
 //! fallback `hc` uses when there is no runtime directory.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 pub const DEFAULT_SESSION: &str = "default";
 
 static SOCKET_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 static SESSION_OVERRIDE: OnceLock<String> = OnceLock::new();
+static SERVICE_MODE: AtomicBool = AtomicBool::new(false);
 
 /// `--socket`: set once, before anything resolves a path. Two targets in one
 /// process is a bug, so a second call is refused loudly.
@@ -23,6 +25,16 @@ pub fn set_socket_override(path: PathBuf) {
     }
 }
 
+/// `service`: resolve as the login service does, whatever the manager's
+/// environment holds. HC_SESSION and HC_SOCKET belong to a core terminal; one
+/// imported into the manager (`systemctl --user import-environment` run from
+/// such a terminal) must not move the service off the default session that
+/// install, `start` and `status` take it to watch. `--socket` and `--session`
+/// still win: they are explicit.
+pub fn set_service_mode() {
+    SERVICE_MODE.store(true, Ordering::Relaxed);
+}
+
 /// `--session`: same contract as the socket override.
 pub fn set_session_override(name: String) {
     if let Err(ignored) = SESSION_OVERRIDE.set(name) {
@@ -30,10 +42,14 @@ pub fn set_session_override(name: String) {
     }
 }
 
-/// The core session: `--session`, else `HC_SESSION`, else `default`.
+/// The core session: `--session`, else `HC_SESSION` (not for the service),
+/// else `default`.
 pub fn session() -> String {
     if let Some(name) = SESSION_OVERRIDE.get() {
         return name.clone();
+    }
+    if SERVICE_MODE.load(Ordering::Relaxed) {
+        return DEFAULT_SESSION.to_string();
     }
     match std::env::var("HC_SESSION") {
         Ok(name) if !name.trim().is_empty() => name.trim().to_string(),
@@ -82,8 +98,19 @@ pub fn socket_path() -> Result<PathBuf, String> {
         // whatever core is ambient, and must not redirect it silently.
         inputs.hc_socket = None;
         inputs.config_socket = None;
+    } else if SERVICE_MODE.load(Ordering::Relaxed) {
+        inputs = as_service(inputs);
     }
     Ok(resolve_socket(&inputs))
+}
+
+/// `inputs` as the service sees them.
+pub fn as_service(inputs: SocketInputs) -> SocketInputs {
+    SocketInputs {
+        session: DEFAULT_SESSION.to_string(),
+        hc_socket: None,
+        ..inputs
+    }
 }
 
 pub fn resolve_socket(inputs: &SocketInputs) -> PathBuf {
@@ -188,9 +215,14 @@ pub fn state_dir() -> PathBuf {
 pub fn server_tag() -> String {
     socket_path()
         .ok()
-        .and_then(|path| Some(path.file_stem()?.to_str()?.to_string()))
-        .filter(|stem| !stem.is_empty())
+        .and_then(|path| tag_of(&path))
         .unwrap_or_else(session)
+}
+
+/// The server tag a socket path gives (`<tag>.sock`).
+pub fn tag_of(socket: &Path) -> Option<String> {
+    let stem = socket.file_stem()?.to_str()?;
+    (!stem.is_empty()).then(|| stem.to_string())
 }
 
 fn filesystem_safe(name: &str) -> String {

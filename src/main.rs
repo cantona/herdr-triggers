@@ -28,6 +28,7 @@ A daemon runs per server. --host picks the kind of server (default herdr):
 --follow-app: a core daemon this starts exits once the Herdr app has been
 closed for 10 s (the app's mod passes it).
 
+
 With no target, the command acts on the server the calling shell belongs to -
 which is whichever pane you happen to be in, so be explicit when it matters:
 
@@ -39,6 +40,9 @@ which is whichever pane you happen to be in, so be explicit when it matters:
   start          detach and run the trigger daemon (idempotent)
   restart        stop a running daemon, then start a fresh one
   run            run the daemon in the foreground
+  service        (--host core) foreground daemon for a service manager: waits
+                 for herdr-core, attaches, and waits again when it leaves; if
+                 another daemon holds the lock, waits for that one to exit
   stop           stop a running daemon
   status [--json] report daemon state, rule count and recent log lines
   reload         re-read triggers.toml
@@ -98,18 +102,28 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let follow_app = args.first().is_some_and(|arg| arg == "--follow-app");
+    if follow_app {
+        args.remove(0);
+    }
+    let command = args.first().cloned().unwrap_or_default();
     let _ = HOST.set(host);
-    if args.first().is_some_and(|arg| arg == "--follow-app") {
+    if follow_app {
         // Only a core daemon watches the app; on herdr the flag would be
         // recorded and reported without anything behind it.
         if host != Host::Core {
             eprintln!("--follow-app needs --host core\n\n{USAGE}");
             std::process::exit(2);
         }
-        args.remove(0);
         FOLLOW_APP.store(true, Ordering::Relaxed);
     }
-    let command = args.first().cloned().unwrap_or_default();
+    if command == "service" && (host != Host::Core || follow_app) {
+        eprintln!("service needs --host core and runs without --follow-app\n\n{USAGE}");
+        std::process::exit(2);
+    }
+    if command == "service" {
+        core::paths::set_service_mode();
+    }
     // `status --json` is the one command with a flag of its own; it comes
     // before the target so the target grammar stays one flag.
     let json = command == "status" && args.get(1).is_some_and(|flag| flag == "--json");
@@ -138,6 +152,7 @@ fn main() {
         "start" => start(),
         "restart" => restart(),
         "run" => run_foreground(),
+        "service" => service_main(),
         "stop" => stop(),
         "reload" => signal_daemon(libc::SIGHUP, "reload"),
         "reset" => signal_daemon(libc::SIGUSR1, "reset"),
@@ -228,8 +243,8 @@ fn select_session(host: Host, name: &str) -> Result<(), String> {
 /// Runs the command once per server, in a child so each gets its own resolved
 /// socket and state dir. Returns the worst exit code.
 fn run_for_every_server(host: Host, command: &str, json: bool) -> i32 {
-    if command == "run" {
-        eprintln!("run cannot be used with --all; it stays in the foreground");
+    if command == "run" || command == "service" {
+        eprintln!("{command} cannot be used with --all; it stays in the foreground");
         return 2;
     }
     let servers = match host {
@@ -436,7 +451,7 @@ fn start() -> i32 {
 /// app, that this one does not.
 fn already_running(pid: i32) {
     println!("herdr-triggersd already running (pid {pid})");
-    if FOLLOW_APP.load(Ordering::Relaxed) && !follows_app() {
+    if FOLLOW_APP.load(Ordering::Relaxed) && !follows_app() && !is_service_daemon() {
         println!("it was started without --follow-app and will outlive the app; restart it with --follow-app to change that");
     }
 }
@@ -535,7 +550,74 @@ fn run_foreground() -> i32 {
     0
 }
 
-fn daemon_main() {
+/// `--host core service`: waits for herdr-core, runs the engine while it is
+/// there, and waits again when it leaves. When another daemon holds the lock
+/// it waits for that one to exit rather than exit 1: the manager would
+/// restart it every few seconds for as long as the other daemon lives, and
+/// each attempt's log line would rotate the useful log away. It always
+/// watches the default session (see `set_service_mode`), and exits 1 when
+/// core's config moves that session's socket to another state dir, so the
+/// manager restarts it there.
+fn service_main() -> i32 {
+    let state_dir = match daemon_prologue("service", true) {
+        Prologue::Ready(state_dir) => state_dir,
+        Prologue::Stopped => return 0,
+        Prologue::Held => return 1,
+    };
+    log_line!(
+        "herdr-triggersd {} service starting",
+        env!("CARGO_PKG_VERSION")
+    );
+    let config = config_dir();
+    // The tag whose state dir holds this process's lock and pid.
+    let held = core::paths::server_tag();
+    let served = core::service::serve(
+        &engine::STOP,
+        &waiting_path(),
+        core::service::WAIT_EVERY,
+        core::paths::socket_path,
+        |socket| core::paths::tag_of(socket).as_deref() == Some(held.as_str()),
+        |server| {
+            let mut engine = engine::Engine::new(std::sync::Arc::new(server), &config, &state_dir);
+            engine.run();
+        },
+    );
+    // The dir the lock is in: after a move, state_dir() resolves to the new
+    // core's, whose pidfile may belong to another daemon.
+    let _ = std::fs::remove_file(state_dir.join("triggersd.pid"));
+    match served {
+        core::service::Served::Stopped => {
+            log_line!("service stopping");
+            0
+        }
+        // A failure exit, so the service manager starts it again, now in the
+        // new dir, and its status shows a failure rather than a clean stop.
+        core::service::Served::Moved(socket) => {
+            log_line!(
+                "herdr-core's socket moved to {}; restarting to follow it",
+                socket.display()
+            );
+            1
+        }
+    }
+}
+
+enum Prologue {
+    Ready(PathBuf),
+    /// Another daemon holds the lock.
+    Held,
+    /// Stopped while waiting for the lock.
+    Stopped,
+}
+
+/// How often a service waiting behind another daemon tries the lock.
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Opens the log, takes the singleton lock, and records the pid and `mode`.
+/// With `wait`, a held lock is retried until it is free or a stop arrives;
+/// nothing in the state dir is touched meanwhile, since it is the other
+/// daemon's.
+fn daemon_prologue(mode: &str, wait: bool) -> Prologue {
     let state_dir = state_dir();
     let _ = std::fs::create_dir_all(&state_dir);
     log::init(&log_path());
@@ -552,22 +634,59 @@ fn daemon_main() {
     // two daemons would each answer every prompt - a password typed twice. The
     // lock is held for the process's life; the fd is leaked on purpose.
     if !acquire_singleton_lock(&state_dir) {
-        log_line!("another herdr-triggersd already holds the lock; exiting");
-        return;
+        if !wait {
+            log_line!("another herdr-triggersd already holds the lock; exiting");
+            return Prologue::Held;
+        }
+        // Before the wait, so a stop from the service manager ends it.
+        install_signal_handlers();
+        log_line!("another herdr-triggersd holds the lock; waiting for it");
+        if !wait_for_lock(&state_dir) {
+            return Prologue::Stopped;
+        }
     }
     write_pidfile();
     let _ = std::fs::remove_file(stopping_path());
-    // Whether this daemon leaves with the app, for `status` and for a start
-    // from the app that finds it already running.
-    let _ = std::fs::write(
-        mode_path(),
-        if FOLLOW_APP.load(Ordering::Relaxed) {
-            "follow-app\n"
-        } else {
-            "standalone\n"
-        },
-    );
+    // A killed service leaves its marker behind; this daemon is not waiting.
+    let _ = std::fs::remove_file(waiting_path());
+    // How this daemon was started, for `status`, for a start from the app
+    // that finds it already running, and for `install`, which stops any
+    // daemon the service did not start.
+    let _ = std::fs::write(mode_path(), format!("{mode}\n"));
     install_signal_handlers();
+    Prologue::Ready(state_dir)
+}
+
+/// Takes the lock once it is free; false when a stop arrives first.
+fn wait_for_lock(state_dir: &Path) -> bool {
+    loop {
+        let mut left = LOCK_RETRY;
+        while !left.is_zero() {
+            if engine::STOP.load(Ordering::Relaxed) {
+                return false;
+            }
+            let step = left.min(std::time::Duration::from_millis(50));
+            std::thread::sleep(step);
+            left -= step;
+        }
+        if engine::STOP.load(Ordering::Relaxed) {
+            return false;
+        }
+        if acquire_singleton_lock(state_dir) {
+            return true;
+        }
+    }
+}
+
+fn daemon_main() {
+    let mode = if FOLLOW_APP.load(Ordering::Relaxed) {
+        "follow-app"
+    } else {
+        "standalone"
+    };
+    let Prologue::Ready(state_dir) = daemon_prologue(mode, false) else {
+        return;
+    };
 
     let server: std::sync::Arc<dyn server::Server> = match host() {
         Host::Herdr => std::sync::Arc::new(Client::from_env()),
@@ -593,7 +712,9 @@ fn daemon_main() {
     );
     let mut engine = engine::Engine::new(server, &config_dir(), &state_dir);
     engine.run();
-    let _ = std::fs::remove_file(pid_path());
+    // Not pid_path(): core's config may have moved the socket meanwhile, and
+    // state_dir() would now name another core's dir.
+    let _ = std::fs::remove_file(state_dir.join("triggersd.pid"));
 }
 
 enum Detached {
@@ -755,6 +876,22 @@ fn follows_app() -> bool {
     std::fs::read_to_string(mode_path()).is_ok_and(|mode| mode.trim() == "follow-app")
 }
 
+/// Whether the running daemon is the login service's.
+fn is_service_daemon() -> bool {
+    std::fs::read_to_string(mode_path()).is_ok_and(|mode| mode.trim() == "service")
+}
+
+/// Present while a service daemon has no herdr-core to talk to.
+fn waiting_path() -> PathBuf {
+    state_dir().join("triggersd.waiting")
+}
+
+/// Whether the running daemon is a service waiting for herdr-core. The
+/// marker alone could be left by a killed daemon.
+fn is_waiting(pid: Option<i32>) -> bool {
+    pid.is_some() && waiting_path().exists()
+}
+
 fn stopping_path() -> PathBuf {
     state_dir().join("triggersd.stopping")
 }
@@ -798,9 +935,13 @@ fn status() -> i32 {
     // reader assume.
     println!("{} socket: {}", host().name(), socket_label());
     println!("state dir:    {}", state_dir().display());
-    match running_pid() {
+    let pid = running_pid();
+    match pid {
         Some(pid) => println!("running (pid {pid})"),
         None => println!("not running"),
+    }
+    if is_waiting(pid) {
+        println!("waiting for herdr-core");
     }
     let triggers = config_dir().join("triggers.toml");
     match config::load_triggers(&triggers) {
@@ -840,6 +981,7 @@ fn status_json() -> i32 {
         "socket": socket_label(),
         "state_dir": state_dir().display().to_string(),
         "running": pid.is_some(),
+        "waiting": is_waiting(pid),
         "follows_app": pid.is_some() && follows_app(),
         "pid": pid,
         "config": triggers.display().to_string(),
