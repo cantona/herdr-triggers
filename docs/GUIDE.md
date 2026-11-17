@@ -146,9 +146,10 @@ DEVICE_USER = "admin"
 DEVICE_PASS = "..."
 ```
 
-For a device that issues a per-attempt challenge, use a `coprocess` instead: it
-is fed the screen on stdin and whatever it prints is typed back, so a script can
-read the challenge, decide, and decline by printing nothing.
+For a device that issues a per-attempt challenge, use a `coprocess` instead:
+with `feed_screen = true` it is fed the screen on stdin, and whatever it prints
+is typed back, so a script can read the challenge, decide, and decline by
+printing nothing.
 
 ## Example: failed-SSH alert
 
@@ -320,7 +321,7 @@ which for a credential is the mistake worth catching early.
 | `send_text` | `pane.send_text` |
 | `notify` | `notification.show`, plus optional `sound`, `position`, and `desktop` for a desktop notification that can persist (`notify-send` on Linux, `osascript` on macOS) |
 | `run` | local subprocess |
-| `coprocess` | local subprocess fed the pane snapshot on stdin; its stdout is typed back into the pane, 10 s deadline (a timeout discards the output) |
+| `coprocess` | local subprocess whose stdout is typed back into the pane, 10 s deadline (a timeout discards the output); `feed_screen = true` feeds it the pane snapshot on stdin (its last 48 KiB) |
 | `tab_mark` | `tab.rename` with a marker prefix — stands in for tab colouring, which herdr has no API for |
 
 A renderer-level inline highlight is not available: herdr exposes no such
