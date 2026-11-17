@@ -64,7 +64,7 @@ and takes over when that daemon exits.
 `herdr-triggersd uninstall` takes the same flags.
 
 Rules and secrets live in `~/.config/herdr-triggers/` (`triggers.toml`, and
-`secrets.toml` with mode 0600). The rule schema is in the README.
+`secrets.toml` with mode 0600). The rule schema is in the [guide](docs/GUIDE.md#rule-schema).
 
 ## What you see
 
