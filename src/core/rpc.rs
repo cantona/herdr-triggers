@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! One framed connection to herdr-core.
 //!
 //! The handshake is a plain JSON line: `hello {framed: true}` answered by a

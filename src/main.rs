@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! herdr-triggers: regex-driven terminal triggers as a resident herdr plugin.
 //!
 //! herdr runs plugin hook commands and `wait()`s on them, with 32 in flight at

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! The terminals herdr-core knows, kept current from its event stream.
 //!
 //! `events.subscribe` answers with a snapshot and then pushes every fact

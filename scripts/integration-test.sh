@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
 # Live integration test against a running herdr session.
 #
 # Drives the real thing: a pane running a fake login script, the real daemon

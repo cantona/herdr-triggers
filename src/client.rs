@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! JSON-lines client for herdr's unix socket.
 //!
 //! Every call is one request on its own short-lived connection. The daemon does

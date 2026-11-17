@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! herdr-core's framed mode: `[channel u32 LE][kind u8][len u32 LE][payload]`.
 //! Channel 0 carries JSON-RPC messages, one per DATA frame; attach streams
 //! and event subscriptions get channels of their own.

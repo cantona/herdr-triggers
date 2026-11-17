@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! `triggers.toml` and `secrets.toml` loading.
 //!
 //! The rule schema covers the actions that are portable to herdr's socket API. Secrets never live in the manifest

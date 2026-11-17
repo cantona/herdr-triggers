@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! What the rule engine needs from a terminal server.
 //!
 //! The herdr TUI socket and the herdr-core socket answer the same questions

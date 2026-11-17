@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rule identity, the once-ledger, and the guards that stop a rule firing on
 //! its own output.
 //!

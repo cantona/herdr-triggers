@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! The mod's bindings in the app's `keys.json`, merged under `global`
 //! without touching anyone else's: a key bound elsewhere is never taken
 //! over, and uninstall removes only keys that still open this mod.

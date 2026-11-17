@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! Where herdr-core's socket is, and which session this daemon targets.
 //!
 //! The order copies `hc` itself: an explicit `HC_SOCKET`, the `socket` key

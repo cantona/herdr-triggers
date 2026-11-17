@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! The login service: a systemd user unit on Linux, a launchd agent on
 //! macOS. Both renderers compile everywhere so either can be tested on
 //! either; only `platform_manager` is gated, and every systemctl or

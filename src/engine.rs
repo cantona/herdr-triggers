@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! The resident loop: keep rules armed on the panes they apply to, match them
 //! against each pane's screen, and run the action when one hits.
 //!

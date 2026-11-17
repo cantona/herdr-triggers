@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! `--host core service`: the daemon a login service manager keeps. herdr-core
 //! has no stable unit to bind to (it runs as transient, hash-named jobs), so
 //! the service starts at login and waits for core's socket instead, attaches

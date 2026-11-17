@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // Herdr Triggers: herdr-triggersd on herdr-core, seen from the app.
 // One View, two renders. The daemon is a login service that
 // `herdr-triggersd install` sets up; nothing here starts it on its own. As a

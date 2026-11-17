@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! The real daemon against a fake herdr-core: one framed connection, a
 //! scripted screen, and the bytes a rule types captured on the attach
 //! channel. Also proves the daemon leaves when the core does.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! `herdr-triggersd install` and `uninstall`: the mod, its key bindings, the
 //! config link and the login service for the Herdr desktop app.
 //!

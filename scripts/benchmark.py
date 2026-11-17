@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare release daemons using a private, read-only Herdr API fixture."""
 import argparse
 import collections

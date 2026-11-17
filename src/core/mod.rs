@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! The herdr-core host: the desktop app's terminals, reached over
 //! herdr-core's unix socket instead of herdr's.
 //!
