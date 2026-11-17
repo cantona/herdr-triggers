@@ -3,13 +3,19 @@
 What changed in each release of herdr-triggers. Every release so far is a
 prerelease.
 
-## [Unreleased]
+## [0.2.2] - 2026-11-17
 
 ### Changed
 - Licensed under the Apache License 2.0 instead of MIT; every source file
   carries `SPDX-FileCopyrightText` and `SPDX-License-Identifier: Apache-2.0`
   lines (the `.rs`, `.py`, `.sh` and `.js` files). Releases up to 0.2.1
   remain available under MIT.
+- The README is now an overview with a benchmarks table; the full reference
+  moved to `docs/GUIDE.md`.
+
+### Fixed
+- The docs said a `coprocess` is fed the screen. It is only with
+  `feed_screen = true` (its last 48 KiB); the guide now says so.
 
 ## [0.2.1] - 2026-11-09
 
@@ -86,7 +92,7 @@ prerelease.
 - `${secret:NAME}` references, resolved from `secrets.toml`, so rules never
   carry a secret in plain text.
 
-[Unreleased]: https://github.com/cantona/herdr-triggers/compare/v0.2.1...HEAD
+[0.2.2]: https://github.com/cantona/herdr-triggers/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/cantona/herdr-triggers/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cantona/herdr-triggers/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/cantona/herdr-triggers/compare/v0.1.0...v0.1.1

@@ -40,7 +40,7 @@ Pin a version or track a branch with `--ref`, and skip the prompt with `--yes`
 (or `-y`) — which is required when stdin is not a terminal, so CI must pass it:
 
 ```bash
-herdr plugin install cantona/herdr-triggers --ref v0.1.1 --yes
+herdr plugin install cantona/herdr-triggers --ref v0.2.2 --yes
 ```
 
 Then write your rules — nothing fires until you do:

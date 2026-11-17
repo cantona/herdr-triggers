@@ -56,7 +56,7 @@ and herdr 0.8.2 or newer, or the Herdr desktop app.
 ### herdr TUI
 
 ```sh
-herdr plugin install cantona/herdr-triggers --ref v0.2.1
+herdr plugin install cantona/herdr-triggers --ref v0.2.2
 herdr plugin action invoke triggers-start --plugin cantona.herdr-triggers
 $EDITOR "$(herdr plugin config-dir cantona.herdr-triggers)/triggers.toml"
 herdr plugin action invoke triggers-reload --plugin cantona.herdr-triggers
